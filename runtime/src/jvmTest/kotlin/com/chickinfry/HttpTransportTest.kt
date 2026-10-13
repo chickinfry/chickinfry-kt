@@ -288,11 +288,11 @@ class HttpTransportTest {
                     override fun callFailed(call: Call, ioe: IOException) { failed.countDown() }
                 }
             }.build()
-            val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 5 }
+            val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 6 }
                 .apply { isAccessible = true }
             val observer: (TransportEvent) -> Unit = events::add
             val transport = constructor.newInstance(peer.origin.toHttpUrl(), gatedClient, null,
-                observer, null) as HttpTransport
+                observer, null, null) as HttpTransport
             try {
                 val result = async { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
                 withContext(Dispatchers.IO) { assertTrue(entered.await(3, TimeUnit.SECONDS)) }
@@ -348,9 +348,9 @@ class HttpTransportTest {
                             override fun callFailed(call: Call, ioe: IOException) { failed.countDown() }
                         }
                     }.build()
-                    val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 5 }
+                    val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 6 }
                         .apply { isAccessible = true }
-                    constructor.newInstance(peer.origin.toHttpUrl(), gatedClient, null, observer, callbackGate) as HttpTransport
+                    constructor.newInstance(peer.origin.toHttpUrl(), gatedClient, null, observer, null, callbackGate) as HttpTransport
                 } else original
                 try {
                     val result = async { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }

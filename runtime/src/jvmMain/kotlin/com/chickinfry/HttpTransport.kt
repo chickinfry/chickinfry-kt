@@ -48,7 +48,6 @@ import okio.buffer
 private const val MAX_REQUEST_BYTES = 4 * 1024 * 1024
 private const val MAX_RESPONSE_BYTES = 1024 * 1024
 private val operationPattern = Regex("[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*")
-private val tokenPattern = Regex("[A-Za-z0-9_-]{43}")
 private val errorPattern = Regex("[a-z_]+")
 private val jsonMediaType = "application/json".toMediaType()
 
@@ -57,14 +56,20 @@ class HttpTransport private constructor(
     private val client: OkHttpClient,
     private val bearer: String?,
     private val observer: ((TransportEvent) -> Unit)?,
+    private val sessionStore: SessionStore?,
     private val beforeResponse: (() -> Unit)? = null,
 ) : ClientTransport {
     constructor(origin: String, requestTimeoutMillis: Long = 30_000) :
-        this(validateOrigin(origin), httpClient(requestTimeoutMillis), null, null)
+        this(validateOrigin(origin), httpClient(requestTimeoutMillis), null, null, null)
 
     fun withBearer(token: String): HttpTransport {
-        if (!tokenPattern.matches(token)) throw ClientException("invalid_token")
-        return HttpTransport(origin, client, token, observer, beforeResponse)
+        if (!credentialPattern.matches(token)) throw ClientException("invalid_token")
+        return HttpTransport(origin, client, token, observer, null, beforeResponse)
+    }
+
+    fun withSession(store: SessionStore): HttpTransport {
+        if (validateOrigin(store.origin) != origin) throw ClientException("invalid_origin")
+        return HttpTransport(origin, client, null, observer, store, beforeResponse)
     }
 
     internal fun observed(observer: (TransportEvent) -> Unit): HttpTransport = observed(observer, null)
@@ -96,21 +101,39 @@ class HttpTransport private constructor(
                     }
                 }
             }
-            .build(), bearer, observer, beforeResponse)
+            .build(), bearer, observer, sessionStore, beforeResponse)
 
     override fun toString(): String = "HttpTransport"
 
     override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T {
+        val sessionObservation = currentCoroutineContext()[SessionObservation]
+        sessionObservation?.point?.invoke(SessionPoint("sdk-entered", operation))
+        if (!operationPattern.matches(operation)) throw ClientException("invalid_operation")
+        val bytes = try {
+            input.toString().toByteArray(Charsets.UTF_8)
+        } catch (_: SerializationException) {
+            throw ClientException("invalid_request")
+        }
+        if (bytes.size > MAX_REQUEST_BYTES) throw ClientException("request_too_large")
+        var output: Result<T>? = null
+        fun validate(name: String, response: WireResponse) {
+            if (sessionStore != null && name in listOf("auth.signup", "auth.signin", "auth.refresh")) response.credentials()
+            if (name == operation) output = Result.success(response.decode(decode))
+        }
+        val result = sessionStore?.let { store ->
+            invokeSession(store, operation, bytes, client.callTimeoutMillis.toLong(), sessionObservation) {
+                    name, body, token -> send(name, body, token) { validate(name, it) }
+            }
+        } ?: send(operation, bytes, bearer) { validate(operation, it) }
+        return if (output != null) output.getOrThrow() else result.decode(decode)
+    }
+
+    private suspend fun send(
+        operation: String, bytes: ByteArray, token: String?, validate: (WireResponse) -> Unit,
+    ): WireResponse {
         val observation = observer?.let(::TransportObservation)
         try {
             return withContext(Dispatchers.IO) {
-                if (!operationPattern.matches(operation)) throw ClientException("invalid_operation")
-                val bytes = try {
-                    input.toString().toByteArray(Charsets.UTF_8)
-                } catch (_: SerializationException) {
-                    throw ClientException("invalid_request")
-                }
-                if (bytes.size > MAX_REQUEST_BYTES) throw ClientException("request_too_large")
                 val body = object : RequestBody() {
                     override fun contentType() = jsonMediaType
                     override fun contentLength() = bytes.size.toLong()
@@ -121,17 +144,19 @@ class HttpTransport private constructor(
                     .post(body).apply {
                         // An explicit Accept-Encoding turns off transparent gzip, so the bounded reader decompresses and never pre-buffers gzip extension headers.
                         header("Accept-Encoding", "gzip")
-                        bearer?.let { header("Authorization", "Bearer $it") }
+                        token?.let { header("Authorization", "Bearer $it") }
                         observation?.let { tag(TransportObservation::class.java, it) }
                     }.build()
-                execute(client.newCall(request), observation, decode)
+                execute(client.newCall(request), observation, validate)
             }
         } finally {
             observation?.completed()
         }
     }
 
-    private suspend fun <T> execute(call: Call, observation: TransportObservation?, decode: (JsonObject) -> T): T {
+    private suspend fun execute(
+        call: Call, observation: TransportObservation?, validate: (WireResponse) -> Unit,
+    ): WireResponse {
         val finished = CompletableDeferred<Unit>()
         val cancelled = AtomicBoolean()
         val readerClaimed = AtomicBoolean()
@@ -186,7 +211,7 @@ class HttpTransport private constructor(
                             CoroutineScope(Dispatchers.IO).launch {
                                 try {
                                     if (!continuation.isActive) return@launch
-                                    val result = readResponse(response, observation, ::cancel, decode)
+                                    val result = readResponse(response, observation, ::cancel, validate)
                                     outcome(false)
                                     continuation.resume(result)
                                 } catch (e: IOException) {
@@ -223,12 +248,12 @@ class HttpTransport private constructor(
         }
     }
 
-    private fun <T> readResponse(
+    private fun readResponse(
         response: Response,
         observation: TransportObservation?,
         cancel: () -> Unit,
-        decode: (JsonObject) -> T,
-    ): T {
+        validate: (WireResponse) -> Unit,
+    ): WireResponse {
         val status = response.code
         if (status in 300..399) {
             cancel()
@@ -272,11 +297,7 @@ class HttpTransport private constructor(
             }
             throw OperationError(error.content, status)
         }
-        return try {
-            decode(json)
-        } catch (_: SerializationException) {
-            throw ClientException("invalid_response", status, true)
-        }
+        return WireResponse(json, status).also(validate)
     }
 }
 

@@ -23,6 +23,7 @@ class ClientException(
         "invalid_operation" -> "Invalid operation name."
         "invalid_request" -> "Invalid operation request."
         "invalid_token" -> "Invalid access token."
+        "session_storage_error" -> "Session storage failed."
         "request_too_large" -> "Operation request is too large."
         "response_too_large" -> "Operation response is too large."
         "redirect_not_allowed" -> "Operation redirects are not allowed."
