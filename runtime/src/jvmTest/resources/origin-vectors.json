@@ -1,0 +1,39 @@
+{
+  "revision": "1768bcc135eda3ea24ce0806bae465454c4c8b9e",
+  "path": "conformance/data/suite.json",
+  "case": "C-02",
+  "origins": {
+    "accept": [
+      "https://example.test",
+      "http://127.0.0.1:8080",
+      "http://[::1]:8080",
+      "https://example.test/",
+      "http://127.0.0.1:8080/",
+      "http://127.1.2.3",
+      "http://127.255.255.255",
+      "http://[::1]/"
+    ],
+    "reject": [
+      "http://localhost:8080",
+      "http://192.0.2.1",
+      "https://user@example.test",
+      "https://example.test/path",
+      "https://example.test?x=1",
+      "https://example.test#x",
+      "http://127.1",
+      "http://0x7f000001",
+      "http://0x7f.0.0.1",
+      "http://0177.0.0.1",
+      "http://2130706433",
+      "http://127.00.0.1",
+      "http://[::ffff:127.0.0.1]",
+      "https://example.test//",
+      "https://example.test?",
+      "https://example.test#",
+      "https://example.test/?",
+      "https://example.test/#",
+      "http://127.0.0.1?",
+      "http://[::1]#"
+    ]
+  }
+}
