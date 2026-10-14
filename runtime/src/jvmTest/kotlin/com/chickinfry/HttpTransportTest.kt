@@ -126,8 +126,25 @@ class HttpTransportTest {
         for (chunked in listOf(false, true)) {
             for (size in listOf(RESPONSE_LIMIT, RESPONSE_LIMIT + 1)) {
                 val events = events()
-                Peer { it.reply(valueBody(size), chunked = chunked) }.use { peer ->
-                    val transport = HttpTransport(peer.origin).observed(events::add)
+                // Hold the rest of the body until the prefix is observed so the final read crosses the limit.
+                val prefixSize = RESPONSE_LIMIT - 113
+                val prefixRead = CountDownLatch(1)
+                Peer { exchange ->
+                    val body = valueBody(size).toByteArray()
+                    exchange.requestBody.readBytes()
+                    exchange.responseHeaders.add("Content-Type", "application/json")
+                    exchange.sendResponseHeaders(200, if (chunked) 0 else body.size.toLong())
+                    exchange.responseBody.use { output ->
+                        output.write(body, 0, prefixSize)
+                        output.flush()
+                        assertTrue(prefixRead.await(3, TimeUnit.SECONDS))
+                        output.write(body, prefixSize, body.size - prefixSize)
+                    }
+                }.use { peer ->
+                    val transport = HttpTransport(peer.origin).observed {
+                        events.add(it)
+                        if (it.phase == "read" && it.readBytes == prefixSize.toLong()) prefixRead.countDown()
+                    }
                     if (size == RESPONSE_LIMIT) {
                         assertEquals(size - 12, transport.invoke("probe.echo", emptyInput, ::requiredValue).length)
                     } else {
@@ -139,7 +156,11 @@ class HttpTransportTest {
                         assertEquals(RESPONSE_LIMIT + 1L, events.last().readBytes)
                     }
                     assertTrue(events.all { it.peakRetainedBytes <= RESPONSE_LIMIT })
-                    assertEquals(RESPONSE_LIMIT.toLong(), events.first { it.phase == "reader-closed" }.runtimeRetainedBytes)
+                    val reads = events.filter { it.phase == "read" }
+                    // The read that crosses the limit is not retained, so only bytes accepted before it remain.
+                    val acceptedBytes = if (size == RESPONSE_LIMIT) size.toLong() else reads[reads.lastIndex - 1].readBytes
+                    assertEquals(acceptedBytes, events.first { it.phase == "reader-closed" }.runtimeRetainedBytes,
+                        "chunked=$chunked size=$size")
                     assertTrue(events.all { it.retainedBytes == it.runtimeRetainedBytes + it.libraryRetainedBytes })
                     assertTrue(events.all { it.transientBytes <= it.transientByteBound })
                     assertEquals(1, peer.requests.get())
