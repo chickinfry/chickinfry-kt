@@ -4,7 +4,9 @@ import java.lang.ref.WeakReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -46,6 +48,8 @@ internal class WireResponse(val json: JsonObject, val status: Int) {
 
 private class RefreshFlight {
     val result = CompletableDeferred<WireResponse>()
+    val sent = CompletableDeferred<Unit>()
+    lateinit var worker: Job
 }
 
 private class SessionCoordination {
@@ -120,10 +124,10 @@ private suspend fun refresh(
     observation: SessionObservation?,
     send: suspend (String, ByteArray, String?) -> WireResponse,
 ): WireResponse {
-    val (flight, participated) = state.mutex.withLock {
+    val (flight, participated, leader) = state.mutex.withLock {
         if (refreshToken in state.suspended) throw ClientException("invalid_token", outcomeUnknown = true)
         val existing = state.flights[refreshToken]
-        if (existing != null) existing to !existing.result.isCompleted else {
+        if (existing != null) Triple(existing, !existing.result.isCompleted, false) else {
             if (expected != null && expected.refreshToken != refreshToken) throw ClientException("invalid_token")
             if (read(store) != expected) throw ClientException("invalid_token")
             // Retire completed flights so past credentials do not accumulate on every rotation.
@@ -131,12 +135,13 @@ private suspend fun refresh(
             val created = RefreshFlight().also { created ->
                 state.flights[refreshToken] = created
                 val scope = CoroutineScope(Dispatchers.IO)
-                scope.launch {
+                created.worker = scope.launch(start = CoroutineStart.LAZY) {
                     val startedAt = System.nanoTime()
                     var httpStatus: Int? = null
                     try {
                         // Deadline and status observation of the send itself stay in the existing transport layer.
-                        val result = send("auth.refresh", bytes, expected?.accessToken)
+                        val result = if (observation == null) send("auth.refresh", bytes, expected?.accessToken)
+                        else withContext(RefreshTransmission(created.sent)) { send("auth.refresh", bytes, expected?.accessToken) }
                         httpStatus = result.status
                         val response = withTimeout(timeoutMillis - (System.nanoTime() - startedAt) / 1_000_000) {
                             val replacement = result.credentials()
@@ -170,14 +175,23 @@ private suspend fun refresh(
                                 }
                             }
                             created.result.completeExceptionally(finalFailure)
+                            created.sent.completeExceptionally(finalFailure)
                         }
                     } finally {
                         scope.cancel()
                     }
                 }
+                observation?.worker?.invoke(created.worker)
+                created.worker.start()
             }
-            created to true
+            Triple(created, false, true)
         }
+    }
+    if (!leader) observation?.worker?.invoke(flight.worker)
+    // Barrier waits belong to the caller; the shared worker only signals transmission.
+    if (leader && observation != null) {
+        flight.sent.await()
+        observation.point.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
     }
     if (participated) observation?.point?.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
     val response = flight.result.await()

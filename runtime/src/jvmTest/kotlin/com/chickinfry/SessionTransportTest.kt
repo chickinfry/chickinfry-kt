@@ -221,6 +221,52 @@ class SessionTransportTest {
         concurrentRefresh(cancelFirst = true)
     }
 
+    @Test
+    fun leaderBarrierDeadlineDoesNotFailSuccessfulSharedRefresh() = runBlocking {
+        val original = credentials('a')
+        val rotated = credentials('c')
+        val release = CountDownLatch(1)
+        val leaderJoined = CompletableDeferred<Unit>()
+        val followerJoined = CompletableDeferred<Unit>()
+        val refreshes = AtomicInteger()
+        SessionPeer { exchange ->
+            if (exchange.requestURI.path == "/auth.refresh") {
+                refreshes.incrementAndGet()
+                release.await(3, TimeUnit.SECONDS)
+                exchange.respond(wire(rotated).toString())
+            } else if (exchange.requestHeaders.getFirst("Authorization") == "Bearer ${original.accessToken}") {
+                exchange.respond("{\"error\":\"invalid_token\"}", 401)
+            } else exchange.respond("{}")
+        }.use { peer ->
+            val store = MemorySessionStore(peer.origin, original)
+            val transport = HttpTransport(peer.origin, 2500).withSession(store)
+            val startedAt = System.nanoTime()
+            try {
+                val leader = async(SessionObservation("leader", { point ->
+                    if (point.point == "refresh-joined") {
+                        leaderJoined.complete(Unit)
+                        val remaining = 1000 - (System.nanoTime() - startedAt) / 1_000_000
+                        withTimeout(remaining) { CompletableDeferred<Unit>().await() }
+                    }
+                })) {
+                    runCatching { withTimeout(1000) { transport.invoke("probe.echo", empty) { it } } }
+                }
+                withTimeout(2000) { leaderJoined.await() }
+                val follower = async(SessionObservation("follower", { point ->
+                    if (point.point == "refresh-joined") followerJoined.complete(Unit)
+                })) {
+                    runCatching { withTimeout(2000) { transport.invoke("probe.echo", empty) { it } } }
+                }
+                withTimeout(1000) { followerJoined.await() }
+                assertTrue(withTimeout(1500) { leader.await() }.isFailure)
+                release.countDown()
+                withTimeout(2000) { follower.await() }.getOrThrow()
+                assertEquals(rotated, store.read())
+                assertEquals(1, refreshes.get())
+            } finally { release.countDown(); transport.close() }
+        }
+    }
+
     private suspend fun concurrentRefresh(cancelFirst: Boolean) = kotlinx.coroutines.coroutineScope {
         val original = credentials('a')
         val rotated = credentials('c')
@@ -230,7 +276,11 @@ class SessionTransportTest {
         val refreshes = AtomicInteger()
         val originals = AtomicInteger()
         val joins = Collections.synchronizedList(mutableListOf<Any>())
+        val workers = Collections.synchronizedList(mutableListOf<kotlinx.coroutines.Job>())
         val rejected = AtomicInteger()
+        val sentAtJoin = Collections.synchronizedList(mutableListOf<Int>())
+        val events = mapOf("first" to Collections.synchronizedList(mutableListOf<CallEvent>()), "second" to Collections.synchronizedList(mutableListOf<CallEvent>()))
+        val observations = events.mapValues { (id, events) -> CallObservation(id, events::add) }
         val joined = CountDownLatch(2)
         SessionPeer { exchange ->
             if (exchange.requestURI.path == "/auth.refresh") {
@@ -252,18 +302,23 @@ class SessionTransportTest {
                 fun observation(id: String) = SessionObservation(id, { event ->
                     when (event.point) {
                         "both-originals-rejected" -> rejected.incrementAndGet()
-                        "refresh-joined" -> { joins += event.flight!!; joined.countDown() }
+                        "refresh-joined" -> {
+                            joins += event.flight!!
+                            sentAtJoin += observations.getValue(id).transmissions().count { it == "auth.refresh" }
+                            joined.countDown()
+                        }
                     }
-                })
-                val first = async(observation("first")) {
+                }, worker = { workers += it })
+                val first = async(observation("first") + observations.getValue("first")) {
                     runCatching { HttpTransport(peer.origin).withSession(store).invoke("probe.echo", empty) { it } }
                 }
-                val second = async(observation("second")) {
+                val second = async(observation("second") + observations.getValue("second")) {
                     runCatching { HttpTransport(peer.origin).withSession(store).invoke("probe.echo", empty) { it } }
                 }
                 awaitLatch(joined)
                 awaitLatch(refreshEntered)
                 assertEquals(2, rejected.get())
+                assertEquals(listOf(0, 1), sentAtJoin.sorted())
                 if (cancelFirst) first.cancelAndJoin()
                 release.countDown()
                 val firstResult = if (!cancelFirst) withTimeout(3000) { first.await() } else null
@@ -273,7 +328,21 @@ class SessionTransportTest {
                 secondResult.getOrThrow()
                 assertEquals(if (cancelFirst) 3 else 4, originals.get())
                 assertTrue(joins[0] === joins[1])
+                assertEquals(2, workers.size)
+                assertTrue(workers[0] === workers[1])
+                withTimeout(1000) { workers[0].join() }
+                assertTrue(workers[0].isCompleted)
                 assertEquals(rotated, store.read())
+                if (!cancelFirst) {
+                    events.forEach { (id, observed) ->
+                        assertEquals(1, observed.count { it.phase == "completed" })
+                        assertTrue(observed.all { it.callId == id })
+                        assertTrue(observed.zipWithNext().all { (a, b) -> a.readBytes <= b.readBytes && a.peakRetainedBytes <= b.peakRetainedBytes && a.elapsedMs <= b.elapsedMs })
+                        assertEquals(observed.filter { it.phase == "read" }.last().readBytes, observed.last().readBytes)
+                        assertEquals(1, observed.count { it.phase == "headers" })
+                    }
+                    assertEquals(1, observations.values.sumOf { it.transmissions().count { name -> name == "auth.refresh" } })
+                }
             } finally { release.countDown() }
         }
     }

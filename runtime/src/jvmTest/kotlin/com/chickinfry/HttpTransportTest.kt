@@ -51,6 +51,30 @@ private val emptyInput = buildJsonObject {}
 
 class HttpTransportTest {
     @Test
+    fun constructorCounterMeasuresRealNetworkEntryAndRawErrors() = runBlocking {
+        val counter = NetworkCounter()
+        Peer { it.reply("{}") }.use { peer ->
+            val transport = NetworkCounter.capture(counter) { HttpTransport(peer.origin) }
+            assertEquals(0L, counter.snapshot())
+            assertFailsWith<ClientException> { NetworkCounter.capture(counter) { HttpTransport("not-an-origin") } }
+            assertEquals(0L, counter.snapshot())
+            val observation = CallObservation("counter") {}
+            withContext(observation) { transport.invoke("probe.echo", emptyInput) { it } }
+            assertTrue(counter.snapshot() > 0)
+            assertEquals(listOf("probe.echo"), observation.transmissions())
+            observation.raw("raw-body-secret")
+            assertFalse(observation.exposesRawDetails(ClientException("invalid_response")))
+            assertTrue(observation.exposesRawDetails(IllegalStateException("raw-body-secret")))
+            assertFalse(observation.exposesRawDetails(IllegalStateException("Safe failure.", IllegalArgumentException("Safe cause."))))
+            assertTrue(observation.exposesRawDetails(object : IllegalStateException("raw-body-secret") {
+                override fun toString(): String = "Safe display."
+            }))
+            assertTrue(observation.exposesRawDetails(IllegalStateException("Safe failure.", IllegalArgumentException("raw-body-secret"))))
+            transport.close()
+        }
+    }
+
+    @Test
     fun commonOriginVectorsAndRejectedOriginsNeverSend() = runBlocking {
         val vectors = Json.parseToJsonElement(
             assertNotNull(javaClass.getResource("/origin-vectors.json")).readText(),

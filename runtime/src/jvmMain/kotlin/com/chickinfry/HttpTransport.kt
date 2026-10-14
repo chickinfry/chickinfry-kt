@@ -19,6 +19,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -103,35 +104,45 @@ class HttpTransport private constructor(
             }
             .build(), bearer, observer, sessionStore, beforeResponse)
 
+    internal fun close() {
+        client.dispatcher.cancelAll()
+        client.connectionPool.evictAll()
+        client.dispatcher.executorService.shutdown()
+    }
+
     override fun toString(): String = "HttpTransport"
 
     override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T {
         val sessionObservation = currentCoroutineContext()[SessionObservation]
-        sessionObservation?.point?.invoke(SessionPoint("sdk-entered", operation))
-        if (!operationPattern.matches(operation)) throw ClientException("invalid_operation")
-        val bytes = try {
-            input.toString().toByteArray(Charsets.UTF_8)
-        } catch (_: SerializationException) {
-            throw ClientException("invalid_request")
-        }
-        if (bytes.size > MAX_REQUEST_BYTES) throw ClientException("request_too_large")
-        var output: Result<T>? = null
-        fun validate(name: String, response: WireResponse) {
-            if (sessionStore != null && name in listOf("auth.signup", "auth.signin", "auth.refresh")) response.credentials()
-            if (name == operation) output = Result.success(response.decode(decode))
-        }
-        val result = sessionStore?.let { store ->
-            invokeSession(store, operation, bytes, client.callTimeoutMillis.toLong(), sessionObservation) {
-                    name, body, token -> send(name, body, token) { validate(name, it) }
+        val callObservation = currentCoroutineContext()[CallObservation]
+        try {
+            sessionObservation?.point?.invoke(SessionPoint("sdk-entered", operation))
+            if (!operationPattern.matches(operation)) throw ClientException("invalid_operation")
+            val bytes = try {
+                input.toString().toByteArray(Charsets.UTF_8)
+            } catch (_: SerializationException) {
+                throw ClientException("invalid_request")
             }
-        } ?: send(operation, bytes, bearer) { validate(operation, it) }
-        return if (output != null) output.getOrThrow() else result.decode(decode)
+            if (bytes.size > MAX_REQUEST_BYTES) throw ClientException("request_too_large")
+            var output: Result<T>? = null
+            fun validate(name: String, response: WireResponse) {
+                if (sessionStore != null && name in listOf("auth.signup", "auth.signin", "auth.refresh")) response.credentials()
+                if (name == operation) output = Result.success(response.decode(decode))
+            }
+            val result = sessionStore?.let { store ->
+                invokeSession(store, operation, bytes, client.callTimeoutMillis.toLong(), sessionObservation) {
+                        name, body, token -> send(name, body, token, callObservation) { validate(name, it) }
+                }
+            } ?: send(operation, bytes, bearer, callObservation) { validate(operation, it) }
+            return if (output != null) output.getOrThrow() else result.decode(decode)
+        } finally { callObservation?.completed() }
     }
 
     private suspend fun send(
-        operation: String, bytes: ByteArray, token: String?, validate: (WireResponse) -> Unit,
+        operation: String, bytes: ByteArray, token: String?, callObservation: CallObservation?, validate: (WireResponse) -> Unit,
     ): WireResponse {
-        val observation = observer?.let(::TransportObservation)
+        val observation = callObservation?.exchange(sessionStore != null) ?: observer?.let(::TransportObservation)
+        val transmission = currentCoroutineContext()[RefreshTransmission]
         try {
             return withContext(Dispatchers.IO) {
                 val body = object : RequestBody() {
@@ -147,7 +158,7 @@ class HttpTransport private constructor(
                         token?.let { header("Authorization", "Bearer $it") }
                         observation?.let { tag(TransportObservation::class.java, it) }
                     }.build()
-                execute(client.newCall(request), observation, validate)
+                execute(client.newCall(request), observation, callObservation, transmission, validate)
             }
         } finally {
             observation?.completed()
@@ -155,8 +166,8 @@ class HttpTransport private constructor(
     }
 
     private suspend fun execute(
-        call: Call, observation: TransportObservation?, validate: (WireResponse) -> Unit,
-    ): WireResponse {
+        call: Call, observation: TransportObservation?, callObservation: CallObservation?, transmission: RefreshTransmission?, validate: (WireResponse) -> Unit,
+    ): WireResponse = coroutineScope {
         val finished = CompletableDeferred<Unit>()
         val cancelled = AtomicBoolean()
         val readerClaimed = AtomicBoolean()
@@ -168,9 +179,14 @@ class HttpTransport private constructor(
         }
         call.addEventListener(object : EventListener() {
             override fun requestHeadersStart(call: Call) { outcome(null) }
+            override fun canceled(call: Call) { observation?.cancellationObserved() }
             // On fixed HTTP/1.1 bodies this event fires only after the sink closes and the socket is flushed.
             override fun requestBodyEnd(call: Call, byteCount: Long) {
-                if (byteCount > 0) outcome(true)
+                if (byteCount > 0) {
+                    outcome(true)
+                    callObservation?.transmitted(call.request().url.encodedPath.removePrefix("/"))
+                    transmission?.sent?.complete(Unit)
+                }
             }
             override fun responseHeadersEnd(call: Call, response: Response) {
                 outcome(true)
@@ -185,11 +201,13 @@ class HttpTransport private constructor(
             }
         }
         try {
-            return withTimeout(client.callTimeoutMillis.toLong()) {
+            val result = withTimeout(client.callTimeoutMillis.toLong()) {
                 suspendCancellableCoroutine { continuation ->
                     continuation.invokeOnCancellation { cancel() }
                     call.enqueue(object : Callback {
                         override fun onFailure(call: Call, e: IOException) {
+                            callObservation?.raw(e.javaClass.name)
+                            e.message?.let { callObservation?.raw(it) }
                             try {
                                 if (continuation.isActive) {
                                     cancel()
@@ -211,7 +229,7 @@ class HttpTransport private constructor(
                             CoroutineScope(Dispatchers.IO).launch {
                                 try {
                                     if (!continuation.isActive) return@launch
-                                    val result = readResponse(response, observation, ::cancel, validate)
+                                    val result = readResponse(response, observation, callObservation, ::cancel, validate)
                                     outcome(false)
                                     continuation.resume(result)
                                 } catch (e: IOException) {
@@ -228,6 +246,7 @@ class HttpTransport private constructor(
                                 } finally {
                                     try {
                                         response.close()
+                                        observation?.closed()
                                     } finally {
                                         finished.complete(Unit)
                                     }
@@ -237,6 +256,7 @@ class HttpTransport private constructor(
                     })
                 }
             }
+            result
         } catch (_: TimeoutCancellationException) {
             currentCoroutineContext().ensureActive()
             throw ClientException("request_timeout", status.get().takeIf { it != 0 }, outcomeUnknown.get() != false)
@@ -251,10 +271,12 @@ class HttpTransport private constructor(
     private fun readResponse(
         response: Response,
         observation: TransportObservation?,
+        callObservation: CallObservation?,
         cancel: () -> Unit,
         validate: (WireResponse) -> Unit,
     ): WireResponse {
         val status = response.code
+        response.headers.forEach { (_, value) -> callObservation?.raw(value) }
         if (status in 300..399) {
             cancel()
             throw ClientException("redirect_not_allowed", status)
@@ -284,6 +306,7 @@ class HttpTransport private constructor(
             val bytes = buffer.readByteArray()
             val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()
+            callObservation?.raw(text)
             Json.parseToJsonElement(text) as? JsonObject ?: throw ClientException("invalid_response", status, true)
         } catch (_: CharacterCodingException) {
             throw ClientException("invalid_response", status, true)
@@ -302,8 +325,14 @@ class HttpTransport private constructor(
 }
 
 private fun httpClient(timeout: Long): OkHttpClient {
+    val network = NetworkCounter.current()
     if (timeout !in 1..Int.MAX_VALUE.toLong()) throw ClientException("invalid_timeout")
     return OkHttpClient.Builder()
+        .eventListenerFactory { object : EventListener() {
+            override fun callStart(call: Call) { network?.entered() }
+            override fun dnsStart(call: Call, domainName: String) { network?.entered() }
+            override fun connectStart(call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy) { network?.entered() }
+        } }
         .protocols(listOf(Protocol.HTTP_1_1))
         .followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
         .authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE)
