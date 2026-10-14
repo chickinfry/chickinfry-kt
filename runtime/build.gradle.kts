@@ -36,6 +36,14 @@ tasks.withType<JavaCompile>().configureEach {
     options.release.set(8)
 }
 
+// CI-only override: Gradle stays on the mise JDK while tests run on the lower-bound JVM.
+// Without the property the local default JVM runs the tests, as before.
+tasks.withType<Test>().configureEach {
+    providers.gradleProperty("testJvmHome").orNull?.let { home ->
+        executable = file("$home/bin/java").absolutePath
+    }
+}
+
 publishing {
     publications.withType<MavenPublication>().configureEach {
         artifactId = if (name == "kotlinMultiplatform") "chickinfry" else "chickinfry-$name"
