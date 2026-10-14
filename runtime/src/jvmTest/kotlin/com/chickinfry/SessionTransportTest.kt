@@ -117,9 +117,15 @@ class SessionTransportTest {
         for ((code, status) in listOf("invalid_token" to 403, "forbidden" to 401, "service_busy" to 500)) {
             SessionPeer { it.respond("{\"error\":\"$code\"}", status) }.use { peer ->
                 val store = MemorySessionStore(peer.origin, original)
+                val events = mutableListOf<CallEvent>()
                 val failure = assertFailsWith<OperationError> {
-                    HttpTransport(peer.origin).withSession(store).invoke("probe.echo", empty) { it }
+                    withContext(CallObservation("original", events::add)) {
+                        HttpTransport(peer.origin).withSession(store).invoke("probe.echo", empty) { it }
+                    }
                 }
+                assertEquals(status, events.last().httpStatus)
+                assertEquals(1, events.count { it.phase == "headers" })
+                assertEquals(1, events.count { it.phase == "completed" })
                 assertEquals(code, failure.code)
                 assertFalse(failure.outcomeUnknown)
                 assertEquals(1, peer.requests.get())
@@ -213,7 +219,7 @@ class SessionTransportTest {
 
     @Test
     fun twoClientsShareOneInFlightRefresh() = runBlocking {
-        concurrentRefresh(cancelFirst = false)
+        for (status in listOf(200, 401, 503, 307)) concurrentRefresh(cancelFirst = false, refreshStatus = status)
     }
 
     @Test
@@ -267,7 +273,7 @@ class SessionTransportTest {
         }
     }
 
-    private suspend fun concurrentRefresh(cancelFirst: Boolean) = kotlinx.coroutines.coroutineScope {
+    private suspend fun concurrentRefresh(cancelFirst: Boolean, refreshStatus: Int = 200) = kotlinx.coroutines.coroutineScope {
         val original = credentials('a')
         val rotated = credentials('c')
         val originalsEntered = CountDownLatch(2)
@@ -287,14 +293,15 @@ class SessionTransportTest {
                 refreshes.incrementAndGet()
                 refreshEntered.countDown()
                 release.await(5, TimeUnit.SECONDS)
-                exchange.respond(wire(rotated).toString())
+                if (refreshStatus == 200) exchange.respond(wire(rotated).toString())
+                else exchange.respond("{\"error\":\"invalid_token\"}", refreshStatus)
             } else {
                 originals.incrementAndGet()
                 if (exchange.requestHeaders.getFirst("Authorization") == "Bearer ${original.accessToken}") {
                     originalsEntered.countDown()
                     assertTrue(originalsEntered.await(3, TimeUnit.SECONDS))
-                    exchange.respond("{\"error\":\"invalid_token\"}", 401)
-                } else exchange.respond("{}")
+                    exchange.respond("{\"error\":\"invalid_token\",\"padding\":\"${"x".repeat(600000)}\"}", 401)
+                } else exchange.respond("{\"padding\":\"${"x".repeat(600000)}\"}")
             }
         }.use { peer ->
             try {
@@ -324,21 +331,47 @@ class SessionTransportTest {
                 val firstResult = if (!cancelFirst) withTimeout(3000) { first.await() } else null
                 val secondResult = withTimeout(3000) { second.await() }
                 assertEquals(1, refreshes.get())
-                firstResult?.getOrThrow()
-                secondResult.getOrThrow()
-                assertEquals(if (cancelFirst) 3 else 4, originals.get())
+                if (refreshStatus == 200) {
+                    firstResult?.getOrThrow()
+                    secondResult.getOrThrow()
+                } else {
+                    assertTrue(firstResult!!.isFailure)
+                    assertTrue(secondResult.isFailure)
+                }
+                assertEquals(if (refreshStatus != 200) 2 else if (cancelFirst) 3 else 4, originals.get())
                 assertTrue(joins[0] === joins[1])
                 assertEquals(2, workers.size)
                 assertTrue(workers[0] === workers[1])
                 withTimeout(1000) { workers[0].join() }
                 assertTrue(workers[0].isCompleted)
-                assertEquals(rotated, store.read())
+                if (refreshStatus == 200) assertEquals(rotated, store.read())
+                else if (refreshStatus == 401) assertNull(store.read())
+                else assertEquals(original, store.read())
+                if (cancelFirst) {
+                    val completed = events.getValue("first").single { it.phase == "completed" }
+                    assertNull(completed.httpStatus)
+                    assertNull(completed.readBytes)
+                    assertTrue(events.getValue("first").all { it.callId == "first" })
+                }
                 if (!cancelFirst) {
                     events.forEach { (id, observed) ->
                         assertEquals(1, observed.count { it.phase == "completed" })
                         assertTrue(observed.all { it.callId == id })
-                        assertTrue(observed.zipWithNext().all { (a, b) -> a.readBytes <= b.readBytes && a.peakRetainedBytes <= b.peakRetainedBytes && a.elapsedMs <= b.elapsedMs })
-                        assertEquals(observed.filter { it.phase == "read" }.last().readBytes, observed.last().readBytes)
+                        assertTrue(observed.zipWithNext().all { (a, b) -> a.elapsedMs <= b.elapsedMs })
+                        assertTrue(observed.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
+                        assertEquals(if (refreshStatus == 200) 200 else refreshStatus, observed.last().httpStatus)
+                        assertTrue(observed.filter { it.phase != "read" }.all { it.httpStatus == if (refreshStatus == 200) 200 else refreshStatus })
+                        assertFalse(observed.any { it.phase == "limit" })
+                        val ownedRefresh = observations.getValue(id).transmissions().count { it == "auth.refresh" }
+                        val originalSize = "{\"error\":\"invalid_token\",\"padding\":\"${"x".repeat(600000)}\"}".toByteArray().size
+                        val retrySize = if (refreshStatus == 200) "{\"padding\":\"${"x".repeat(600000)}\"}".toByteArray().size else 0
+                        val refreshSize = when (refreshStatus) {
+                            200 -> wire(rotated).toString().toByteArray().size
+                            307 -> 0
+                            else -> "{\"error\":\"invalid_token\"}".toByteArray().size
+                        }
+                        assertEquals(originalSize.toLong() + retrySize + ownedRefresh * refreshSize, observations.getValue(id).readBytes)
+                        if (refreshStatus == 200) assertTrue(observations.getValue(id).readBytes > 1048576)
                         assertEquals(1, observed.count { it.phase == "headers" })
                     }
                     assertEquals(1, observations.values.sumOf { it.transmissions().count { name -> name == "auth.refresh" } })
@@ -482,7 +515,13 @@ class SessionTransportTest {
                     }
                 }
                 val session = HttpTransport(peer.origin, 500).withSession(broken)
-                val failure = assertFailsWith<ClientException> { session.invoke("probe.echo", empty) { it } }
+                val observed = mutableListOf<CallEvent>()
+                val failure = assertFailsWith<ClientException> {
+                    withContext(CallObservation("storage", observed::add)) { session.invoke("probe.echo", empty) { it } }
+                }
+                assertEquals(200, observed.last().httpStatus)
+                assertEquals(1, observed.count { it.phase == "completed" })
+                assertTrue(observed.filter { it.phase != "read" }.all { it.httpStatus == 200 })
                 assertEquals(if (timeout) "request_timeout" else "session_storage_error", failure.code)
                 assertTrue(failure.outcomeUnknown)
                 assertEquals(200, failure.httpStatus)

@@ -153,6 +153,8 @@ class HttpTransportTest {
                 // Hold the rest of the body until the prefix is observed so the final read crosses the limit.
                 val prefixSize = RESPONSE_LIMIT - 113
                 val prefixRead = CountDownLatch(1)
+                val oracle = mutableListOf<Triple<Long, Long, Int>>()
+                val calls = mutableListOf<CallEvent>()
                 Peer { exchange ->
                     val body = valueBody(size).toByteArray()
                     exchange.requestBody.readBytes()
@@ -165,10 +167,12 @@ class HttpTransportTest {
                         output.write(body, prefixSize, body.size - prefixSize)
                     }
                 }.use { peer ->
-                    val transport = HttpTransport(peer.origin).observed {
+                    val transport = HttpTransport(peer.origin).observed({
                         events.add(it)
                         if (it.phase == "read" && it.readBytes == prefixSize.toLong()) prefixRead.countDown()
-                    }
+                    }, null, { sdk, source, received -> oracle += Triple(sdk.size, source.size, received) })
+                        .withSession(MemorySessionStore(peer.origin))
+                    withContext(CallObservation("boundary", calls::add)) {
                     if (size == RESPONSE_LIMIT) {
                         assertEquals(size - 12, transport.invoke("probe.echo", emptyInput, ::requiredValue).length)
                     } else {
@@ -179,14 +183,35 @@ class HttpTransportTest {
                         assertStopped(events, "limit")
                         assertEquals(RESPONSE_LIMIT + 1L, events.last().readBytes)
                     }
+                    }
                     assertTrue(events.all { it.peakRetainedBytes <= RESPONSE_LIMIT })
                     val reads = events.filter { it.phase == "read" }
+                    assertEquals(oracle.size, reads.size)
+                    reads.zip(oracle).forEach { (event, actual) ->
+                        assertEquals(actual.first, event.runtimeRetainedBytes)
+                        assertEquals(actual.second, event.transientBytes)
+                        assertEquals(actual.first + if (actual.second > 65536) actual.second else 0, event.retainedBytes)
+                    }
+                    assertEquals(size.toLong(), oracle.sumOf { it.third.toLong() })
+                    if (size > RESPONSE_LIMIT) {
+                        val overflow = events.indexOfFirst { it.phase == "limit" }
+                        assertEquals("read", events[overflow - 1].phase)
+                        assertEquals(RESPONSE_LIMIT + 1L, events[overflow - 1].readBytes)
+                        assertEquals(oracle.last().first, events[overflow].runtimeRetainedBytes)
+                        val phases = calls.map { it.phase }
+                        val limit = phases.indexOf("limit")
+                        assertEquals("read", phases[limit - 1])
+                        assertEquals("headers", phases[limit + 1])
+                        assertFalse(phases.drop(limit + 1).contains("read"))
+                    }
                     // The read that crosses the limit is not retained, so only bytes accepted before it remain.
                     val acceptedBytes = if (size == RESPONSE_LIMIT) size.toLong() else reads[reads.lastIndex - 1].readBytes
                     assertEquals(acceptedBytes, events.first { it.phase == "reader-closed" }.runtimeRetainedBytes,
                         "chunked=$chunked size=$size")
                     assertTrue(events.all { it.retainedBytes == it.runtimeRetainedBytes + it.libraryRetainedBytes })
                     assertTrue(events.all { it.transientBytes <= it.transientByteBound })
+                    assertTrue(calls.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
+                    assertEquals(1, calls.count { it.phase == "completed" })
                     assertEquals(1, peer.requests.get())
                     assertEquals("completed", events.last().phase)
                     assertEquals(0L, events.last().retainedBytes)
@@ -210,7 +235,9 @@ class HttpTransportTest {
                     it.responseHeaders.add("Content-Encoding", "gzip")
                     it.reply(gzip)
                 }.use { peer ->
+                    val calls = mutableListOf<CallEvent>()
                     val transport = HttpTransport(peer.origin).observed(events::add)
+                    withContext(CallObservation("gzip", calls::add)) {
                     if (size == RESPONSE_LIMIT) {
                         assertEquals(size - 12, transport.invoke("probe.echo", emptyInput, ::requiredValue).length)
                     } else {
@@ -218,6 +245,8 @@ class HttpTransportTest {
                             assertFailsWith<ClientException> { transport.invoke("probe.echo", emptyInput) { it } }.code)
                         assertStopped(events, "limit")
                     }
+                    }
+                    assertTrue(calls.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
                     assertEquals(size.toLong(), events.last().readBytes)
                     assertTrue(events.all { it.transientBytes <= it.transientByteBound })
                     assertTrue(events.all { it.peakRetainedBytes <= RESPONSE_LIMIT })
@@ -249,23 +278,49 @@ class HttpTransportTest {
     fun everyRedirectStopsAtHeadersWithoutReadingOrFollowing() = runBlocking {
         for (status in listOf(301, 302, 303, 307, 308)) {
             for (chunked in listOf(false, true)) {
-                for (size in listOf(128, RESPONSE_LIMIT + 4096)) {
-                    val events = events()
-                    Peer {
-                        it.responseHeaders.add("Location", "/probe.follow")
-                        it.reply(valueBody(size), status, chunked)
-                    }.use { peer ->
-                        val failure = assertFailsWith<ClientException> {
-                            HttpTransport(peer.origin).observed(events::add).invoke("probe.echo", emptyInput) { it }
+                for (session in listOf(false, true)) {
+                    val events = Collections.synchronizedList(mutableListOf<CallEvent>())
+                    val headers = CountDownLatch(1)
+                    val tail = CountDownLatch(1)
+                    Peer { exchange ->
+                        exchange.requestBody.readBytes()
+                        exchange.responseHeaders.add("Location", "/probe.follow")
+                        exchange.sendResponseHeaders(status, if (chunked) 0 else 2L * RESPONSE_LIMIT + 1)
+                        exchange.responseBody.use { output ->
+                            output.write(ByteArray(RESPONSE_LIMIT + 1))
+                            output.flush()
+                            tail.await(3, TimeUnit.SECONDS)
+                            output.write(ByteArray(RESPONSE_LIMIT))
                         }
-                        assertEquals("redirect_not_allowed", failure.code)
-                        assertEquals(status, failure.httpStatus)
-                        assertFalse(failure.outcomeUnknown)
-                        assertEquals(1, peer.requests.get())
-                        assertEquals(listOf("headers", "cancel-requested", "cancel-observed", "reader-closed", "completed"),
-                            events.map { it.phase })
-                        assertTrue(events.all { it.readBytes == 0L && it.retainedBytes == 0L })
-                        assertTrue(events.zipWithNext().all { (a, b) -> a.elapsedMs <= b.elapsedMs })
+                    }.use { peer ->
+                        val transport = HttpTransport(peer.origin).let {
+                            if (session) it.withSession(MemorySessionStore(peer.origin)) else it
+                        }
+                        val observation = CallObservation("redirect") {
+                            events += it
+                            if (it.phase == "headers") headers.countDown()
+                        }
+                        try {
+                            val result = async(Dispatchers.Default + observation) {
+                                runCatching { transport.invoke("probe.echo", emptyInput) { it } }
+                            }
+                            withContext(Dispatchers.IO) { assertTrue(headers.await(1, TimeUnit.SECONDS)) }
+                            assertEquals("headers", events.first().phase)
+                            val failure = withTimeout(1000) { result.await() }.exceptionOrNull() as ClientException
+                            assertEquals("redirect_not_allowed", failure.code)
+                            assertEquals(status, failure.httpStatus)
+                            assertFalse(failure.outcomeUnknown)
+                            assertEquals(1, peer.requests.get())
+                            assertEquals(listOf("headers", "cancel-requested", "cancel-observed", "reader-closed", "completed"),
+                                events.map { it.phase })
+                            if (System.getProperty("java.runtime.version") == "27+35") {
+                                assertTrue(events.all { it.readBytes == 0L && it.retainedBytes == 0L && it.peakRetainedBytes == 0L })
+                            } else assertTrue(events.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
+                            assertTrue(events.zipWithNext().all { (a, b) -> a.elapsedMs <= b.elapsedMs })
+                            for (phase in listOf("cancel-observed", "reader-closed")) {
+                                assertTrue(events.first { it.phase == phase }.elapsedMs - events.first().elapsedMs <= 1000)
+                            }
+                        } finally { tail.countDown(); transport.close() }
                     }
                 }
             }
@@ -274,15 +329,24 @@ class HttpTransportTest {
 
     @Test
     fun retryAfterZeroNeverReplaysOneShotPost() = runBlocking {
-        Peer {
-            it.responseHeaders.add("Retry-After", "0")
-            it.reply("{\"error\":\"service_busy\"}", 503)
-        }.use { peer ->
-            val failure = assertFailsWith<OperationError> { HttpTransport(peer.origin).invoke("probe.echo", emptyInput) { it } }
-            assertEquals("service_busy", failure.code)
-            assertEquals(503, failure.httpStatus)
-            assertFalse(failure.outcomeUnknown)
-            assertEquals(1, peer.requests.get())
+        for (chunked in listOf(false, true)) {
+            val events = mutableListOf<CallEvent>()
+            Peer {
+                it.responseHeaders.add("Retry-After", "0")
+                it.reply("{\"error\":\"service_busy\"}", 503, chunked)
+            }.use { peer ->
+                val transport = HttpTransport(peer.origin)
+                val failure = assertFailsWith<OperationError> {
+                    withContext(CallObservation("retry", events::add)) { transport.invoke("probe.echo", emptyInput) { it } }
+                }
+                assertEquals("service_busy", failure.code)
+                assertEquals(503, failure.httpStatus)
+                assertFalse(failure.outcomeUnknown)
+                assertEquals(1, peer.requests.get())
+                assertTrue(events.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
+                assertFalse(events.any { it.phase.startsWith("cancel") })
+                transport.close()
+            }
         }
     }
 
@@ -300,6 +364,14 @@ class HttpTransportTest {
         assertNull(unsent.httpStatus)
         assertNull(unsent.cause)
         assertEquals(false, unsentEvents.last().outcomeUnknown)
+        val secureEvents = mutableListOf<CallEvent>()
+        val secure = assertFailsWith<ClientException> {
+            withContext(CallObservation("https", secureEvents::add)) {
+                HttpTransport(origin.replace("http:", "https:")).invoke("probe.echo", emptyInput) { it }
+            }
+        }
+        assertEquals("transport_error", secure.code)
+        assertTrue(secureEvents.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
         Peer { it.requestBody.readBytes(); it.close() }.use { peer ->
             val events = events()
             val failure = assertFailsWith<ClientException> {
@@ -333,11 +405,11 @@ class HttpTransportTest {
                     override fun callFailed(call: Call, ioe: IOException) { failed.countDown() }
                 }
             }.build()
-            val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 6 }
+            val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 7 }
                 .apply { isAccessible = true }
             val observer: (TransportEvent) -> Unit = events::add
             val transport = constructor.newInstance(peer.origin.toHttpUrl(), gatedClient, null,
-                observer, null, null) as HttpTransport
+                observer, null, null, null) as HttpTransport
             try {
                 val result = async { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
                 withContext(Dispatchers.IO) { assertTrue(entered.await(3, TimeUnit.SECONDS)) }
@@ -365,9 +437,16 @@ class HttpTransportTest {
             val closed = CountDownLatch(1)
             val failed = CountDownLatch(1)
             val callbacks = AtomicInteger()
-            val events = events()
-            Peer { it.reply("{}", 201) }.use { peer ->
-                val observer: (TransportEvent) -> Unit = {
+            val events = Collections.synchronizedList(mutableListOf<CallEvent>())
+            Peer {
+                it.requestBody.readBytes()
+                it.sendResponseHeaders(307, RESPONSE_LIMIT + 1L)
+                it.responseBody.write('{'.code)
+                it.responseBody.flush()
+                release.await(5, TimeUnit.SECONDS)
+                it.close()
+            }.use { peer ->
+                val observation = CallObservation("handoff") {
                     events.add(it)
                     if (it.phase == "reader-closed") closed.countDown()
                 }
@@ -378,46 +457,55 @@ class HttpTransportTest {
                         check(release.await(5, TimeUnit.SECONDS))
                     }
                 }
-                val original = HttpTransport(peer.origin, 500).observed(observer, callbackGate)
-                val transport = if (beforeCallback) {
-                    val field = HttpTransport::class.java.getDeclaredField("client").apply { isAccessible = true }
-                    val client = field.get(original) as OkHttpClient
-                    val gatedClient = client.newBuilder().eventListenerFactory { call ->
-                        client.eventListenerFactory.create(call) + object : EventListener() {
-                            override fun followUpDecision(call: Call, networkResponse: Response, nextRequest: Request?) {
-                                assertEquals(201, networkResponse.code)
-                                assertNull(nextRequest)
-                                entered.countDown()
-                                check(release.await(5, TimeUnit.SECONDS))
-                            }
-                            override fun callFailed(call: Call, ioe: IOException) { failed.countDown() }
+                val original = HttpTransport(peer.origin, 500)
+                val field = HttpTransport::class.java.getDeclaredField("client").apply { isAccessible = true }
+                val client = field.get(original) as OkHttpClient
+                val gatedClient = if (beforeCallback) client.newBuilder().eventListenerFactory { call ->
+                    client.eventListenerFactory.create(call) + object : EventListener() {
+                        override fun followUpDecision(call: Call, networkResponse: Response, nextRequest: Request?) {
+                            assertEquals(307, networkResponse.code)
+                            assertNull(nextRequest)
+                            entered.countDown()
+                            check(release.await(5, TimeUnit.SECONDS))
                         }
-                    }.build()
-                    val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 6 }
-                        .apply { isAccessible = true }
-                    constructor.newInstance(peer.origin.toHttpUrl(), gatedClient, null, observer, null, callbackGate) as HttpTransport
-                } else original
+                        override fun callFailed(call: Call, ioe: IOException) { failed.countDown() }
+                    }
+                }.build() else client
+                val constructor = HttpTransport::class.java.declaredConstructors.single { it.parameterCount == 7 }
+                    .apply { isAccessible = true }
+                val transport = constructor.newInstance(peer.origin.toHttpUrl(), gatedClient, null, null, null, callbackGate, null) as HttpTransport
                 try {
-                    val result = async { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
+                    val result = async(observation) { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
                     withContext(Dispatchers.IO) { assertTrue(entered.await(3, TimeUnit.SECONDS)) }
                     val failure = withTimeout(1500) { result.await() }.exceptionOrNull()
                     assertTrue(failure is ClientException)
                     assertEquals("request_timeout", failure.code)
-                    assertEquals(201, failure.httpStatus)
+                    assertEquals(307, failure.httpStatus)
                     assertTrue(failure.outcomeUnknown)
                     assertEquals(listOf("headers", "cancel-requested", "cancel-observed", "completed"), events.map { it.phase })
-                    assertTrue(events.all { it.httpStatus == 201 && it.outcomeUnknown == true })
+                    assertTrue(events.all { it.httpStatus == 307 })
+                    if (System.getProperty("java.runtime.version") == "27+35") {
+                        assertTrue(events.dropLast(1).all { it.readBytes == 0L && it.retainedBytes == 0L && it.peakRetainedBytes == 0L })
+                    }
+                    assertNull(events.last().readBytes)
+                    assertNull(events.last().retainedBytes)
+                    assertNull(events.last().peakRetainedBytes)
                 } finally {
                     release.countDown()
-                    withContext(Dispatchers.IO) { assertTrue(closed.await(3, TimeUnit.SECONDS)) }
-                    if (beforeCallback) withContext(Dispatchers.IO) { assertTrue(failed.await(3, TimeUnit.SECONDS)) }
+                    try {
+                        withContext(Dispatchers.IO) { assertTrue(closed.await(3, TimeUnit.SECONDS)) }
+                        if (beforeCallback) withContext(Dispatchers.IO) { assertTrue(failed.await(3, TimeUnit.SECONDS)) }
+                    } finally { transport.close() }
                 }
                 assertEquals(listOf("headers", "cancel-requested", "cancel-observed", "completed", "reader-closed"),
                     events.map { it.phase })
+                assertEquals(1, events.count { it.phase == "completed" })
+                assertEquals(1, events.count { it.phase == "reader-closed" })
                 assertTrue(events.zipWithNext().all { (a, b) -> a.elapsedMs <= b.elapsedMs })
-                assertTrue(events.all { it.readBytes == 0L && it.retainedBytes == 0L })
-                assertEquals(201, events.last().httpStatus)
-                assertEquals(true, events.last().outcomeUnknown)
+                assertNull(events.last().readBytes)
+                assertNull(events.last().retainedBytes)
+                assertNull(events.last().peakRetainedBytes)
+                assertEquals(307, events.last().httpStatus)
                 assertEquals(if (beforeCallback) 0 else 1, callbacks.get())
                 assertEquals(1, peer.requests.get())
             }

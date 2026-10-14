@@ -151,12 +151,54 @@ class DriverTest {
             assertEquals("c:second", second.obj("args").string("callId"))
             harness.request("c:observe", "client.observe", buildJsonObject { put("callId", "c:first"); put("afterSequence", 0) })
             val observed = harness.read().obj("result")
-            assertFalse(observed["complete"]!!.jsonPrimitive.boolean)
+            assertTrue(observed["complete"]!!.jsonPrimitive.boolean)
             assertEquals(0, observed["events"]!!.jsonArray.size)
+            val firstWatermark = observed["throughSequence"]!!.jsonPrimitive.long
+            assertEquals(0, firstWatermark)
+            harness.request("c:cross", "client.observe", buildJsonObject {
+                put("callId", "c:first"); put("afterSequence", 0); put("caseId", "other")
+            })
+            assertEquals("invalid_reference", harness.read().obj("error").string("code"))
+            for ((number, after) in listOf(JsonPrimitive(-1), JsonPrimitive(1), JsonPrimitive("0"), JsonPrimitive(0.5)).withIndex()) {
+                harness.request("c:invalid:$number", "client.observe", buildJsonObject { put("callId", "c:first"); put("afterSequence", after) })
+                assertEquals("invalid_args", harness.read().obj("error").string("code"))
+            }
             harness.release(second, 1)
             assertEquals("c:second", harness.read().string("id"))
             harness.release(first, 2)
             assertEquals("c:first", harness.read().string("id"))
+            val allSequences = mutableListOf<Long>()
+            for (callId in listOf("c:first", "c:second")) {
+                fun observe(id: String, after: Long): JsonObject {
+                    harness.request(id, "client.observe", buildJsonObject { put("callId", callId); put("afterSequence", after) })
+                    return harness.read().obj("result")
+                }
+                val final = observe("c:snapshot:$callId", 0)
+                assertEquals(setOf("callId", "throughSequence", "complete", "events"), final.keys)
+                assertFalse(final["complete"]!!.jsonPrimitive.boolean)
+                val through = final["throughSequence"]!!.jsonPrimitive.long
+                val events = final["events"]!!.jsonArray.map { it.jsonObject }
+                assertEquals(1, events.count { it.string("phase") == "completed" })
+                events.forEach { event ->
+                    assertEquals(setOf("sequence", "callId", "elapsedMs", "phase", "httpStatus", "readBytes", "retainedBytes", "peakRetainedBytes"), event.keys)
+                    assertEquals(callId, event.string("callId"))
+                    assertEquals(JsonNull, event["httpStatus"])
+                    assertEquals(JsonNull, event["readBytes"])
+                    assertEquals(JsonNull, event["retainedBytes"])
+                    assertEquals(JsonNull, event["peakRetainedBytes"])
+                    assertTrue(event["sequence"]!!.jsonPrimitive.long in 1..through)
+                }
+                val sequences = events.map { it["sequence"]!!.jsonPrimitive.long }
+                assertEquals(sequences.sorted(), sequences)
+                allSequences += sequences
+                assertEquals(final, observe("c:repeat:$callId", 0))
+                val empty = observe("c:empty:$callId", through)
+                assertFalse(empty["complete"]!!.jsonPrimitive.boolean)
+                assertTrue(empty["events"]!!.jsonArray.isEmpty())
+                val after = sequences.first()
+                assertEquals(events.drop(1), observe("c:interval:$callId", after)["events"]!!.jsonArray.map { it.jsonObject })
+            }
+            assertEquals(allSequences.size, allSequences.toSet().size)
         }
     }
 
@@ -271,7 +313,7 @@ private class Harness(private val fixtures: Fixtures, references: References = R
     fun read(): JsonObject = readWithin(5000) ?: throw AssertionError("Driver response missing.")
     fun send(value: JsonObject) { writer.write((value.toString() + "\n").toByteArray()); writer.flush() }
     fun request(id: String, command: String, args: JsonObject) = send(buildJsonObject {
-        put("id", id); put("command", command); put("args", JsonObject(args + mapOf("caseId" to JsonPrimitive("test"), "timeoutMs" to JsonPrimitive(3000))))
+        put("id", id); put("command", command); put("args", JsonObject(args + mapOf("caseId" to (args["caseId"] ?: JsonPrimitive("test")), "timeoutMs" to JsonPrimitive(3000))))
     })
     fun handshake() {
         send(buildJsonObject {
@@ -281,7 +323,8 @@ private class Harness(private val fixtures: Fixtures, references: References = R
             })
         })
         val response = read().obj("result")
-        assertFalse(response["capabilities"]!!.jsonArray.any { it.jsonPrimitive.content == "client.transport" })
+        assertEquals(listOf("client.create", "client.copy", "client.call", "session.store", "barrier", "session.trace", "client.transport").sorted(),
+            response["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }.sorted())
     }
     fun release(arrival: JsonObject, sequence: Int) = send(buildJsonObject {
         put("id", arrival.string("id")); put("error", JsonNull); put("result", buildJsonObject {

@@ -1,10 +1,12 @@
 package com.chickinfry
 
+import java.io.File
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -31,6 +33,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Authenticator
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.Connection
 import okhttp3.CookieJar
 import okhttp3.EventListener
 import okhttp3.HttpUrl
@@ -52,6 +55,27 @@ private val operationPattern = Regex("[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*")
 private val errorPattern = Regex("[a-z_]+")
 private val jsonMediaType = "application/json".toMediaType()
 
+private val pinnedBufferLibraries by lazy {
+    pinnedJar(OkHttpClient::class.java, "234194a04aac54858df0a750d243af7b2e39df5e4eb86e9912043ad33a9f9a52") &&
+        pinnedJar(Buffer::class.java, "b97b640557a650d15411f2be29aef558c4e422a83653cb18ba494311dbed18be")
+}
+
+private fun pinnedJar(type: Class<*>, expected: String): Boolean = try {
+    val location = type.protectionDomain?.codeSource?.location
+    if (location?.protocol != "file" || !File(location.toURI()).isFile) false else {
+        val digest = MessageDigest.getInstance("SHA-256")
+        File(location.toURI()).inputStream().use { input ->
+            val chunk = ByteArray(8192)
+            while (true) {
+                val size = input.read(chunk)
+                if (size < 0) break
+                digest.update(chunk, 0, size)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) } == expected
+    }
+} catch (_: Exception) { false }
+
 class HttpTransport private constructor(
     private val origin: HttpUrl,
     private val client: OkHttpClient,
@@ -59,50 +83,28 @@ class HttpTransport private constructor(
     private val observer: ((TransportEvent) -> Unit)?,
     private val sessionStore: SessionStore?,
     private val beforeResponse: (() -> Unit)? = null,
+    private val bodyRead: ((Buffer, Buffer, Int) -> Unit)? = null,
 ) : ClientTransport {
     constructor(origin: String, requestTimeoutMillis: Long = 30_000) :
         this(validateOrigin(origin), httpClient(requestTimeoutMillis), null, null, null)
 
     fun withBearer(token: String): HttpTransport {
         if (!credentialPattern.matches(token)) throw ClientException("invalid_token")
-        return HttpTransport(origin, client, token, observer, null, beforeResponse)
+        return HttpTransport(origin, client, token, observer, null, beforeResponse, bodyRead)
     }
 
     fun withSession(store: SessionStore): HttpTransport {
         if (validateOrigin(store.origin) != origin) throw ClientException("invalid_origin")
-        return HttpTransport(origin, client, null, observer, store, beforeResponse)
+        return HttpTransport(origin, client, null, observer, store, beforeResponse, bodyRead)
     }
 
     internal fun observed(observer: (TransportEvent) -> Unit): HttpTransport = observed(observer, null)
 
-    internal fun observed(observer: (TransportEvent) -> Unit, beforeResponse: (() -> Unit)?): HttpTransport =
-        HttpTransport(origin, client.newBuilder()
-            // Responses the library closes before SDK callback handoff are still observed at actual source termination.
-            .addNetworkInterceptor { chain ->
-                val response = chain.proceed(chain.request())
-                val observation = chain.request().tag(TransportObservation::class.java)
-                    ?: return@addNetworkInterceptor response
-                val body = response.body
-                val observedSource = object : ForwardingSource(body.source()) {
-                    override fun close() {
-                        super.close()
-                        observation.closed()
-                    }
-                }.buffer()
-                response.newBuilder().body(object : ResponseBody() {
-                    override fun contentType() = body.contentType()
-                    override fun contentLength() = body.contentLength()
-                    override fun source() = observedSource
-                }).build()
-            }
-            .eventListenerFactory { call ->
-                object : EventListener() {
-                    override fun canceled(call: Call) {
-                        call.request().tag(TransportObservation::class.java)?.cancellationObserved()
-                    }
-                }
-            }
-            .build(), bearer, observer, sessionStore, beforeResponse)
+    internal fun observed(
+        observer: (TransportEvent) -> Unit, beforeResponse: (() -> Unit)?,
+        bodyRead: ((Buffer, Buffer, Int) -> Unit)? = null,
+    ): HttpTransport =
+        HttpTransport(origin, client, bearer, observer, sessionStore, beforeResponse, bodyRead)
 
     internal fun close() {
         client.dispatcher.cancelAll()
@@ -115,6 +117,7 @@ class HttpTransport private constructor(
     override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T {
         val sessionObservation = currentCoroutineContext()[SessionObservation]
         val callObservation = currentCoroutineContext()[CallObservation]
+        callObservation?.entered()
         try {
             sessionObservation?.point?.invoke(SessionPoint("sdk-entered", operation))
             if (!operationPattern.matches(operation)) throw ClientException("invalid_operation")
@@ -130,8 +133,8 @@ class HttpTransport private constructor(
                 if (name == operation) output = Result.success(response.decode(decode))
             }
             val result = sessionStore?.let { store ->
-                invokeSession(store, operation, bytes, client.callTimeoutMillis.toLong(), sessionObservation) {
-                        name, body, token -> send(name, body, token, callObservation) { validate(name, it) }
+                invokeSession(store, operation, bytes, client.callTimeoutMillis.toLong(), sessionObservation, callObservation) {
+                        name, body, token, exchange -> send(name, body, token, callObservation, exchange) { validate(name, it) }
                 }
             } ?: send(operation, bytes, bearer, callObservation) { validate(operation, it) }
             return if (output != null) output.getOrThrow() else result.decode(decode)
@@ -139,9 +142,12 @@ class HttpTransport private constructor(
     }
 
     private suspend fun send(
-        operation: String, bytes: ByteArray, token: String?, callObservation: CallObservation?, validate: (WireResponse) -> Unit,
+        operation: String, bytes: ByteArray, token: String?, callObservation: CallObservation?,
+        exchangeStarted: (CallObservation.Exchange?) -> Unit = {}, validate: (WireResponse) -> Unit,
     ): WireResponse {
-        val observation = callObservation?.exchange(sessionStore != null) ?: observer?.let(::TransportObservation)
+        val exchange = callObservation?.exchange(sessionStore != null, observer)
+        exchangeStarted(exchange)
+        val observation = exchange?.transport ?: observer?.let(::TransportObservation)
         val transmission = currentCoroutineContext()[RefreshTransmission]
         try {
             return withContext(Dispatchers.IO) {
@@ -173,11 +179,23 @@ class HttpTransport private constructor(
         val readerClaimed = AtomicBoolean()
         val outcomeUnknown = AtomicReference<Boolean?>(false)
         val status = AtomicInteger()
+        var directLoopback = false
+        val pinnedBuffers = observation != null && client.socketFactory === javax.net.SocketFactory.getDefault() && pinnedBufferLibraries
         fun outcome(value: Boolean?) {
             outcomeUnknown.set(value)
             observation?.outcome(value)
         }
         call.addEventListener(object : EventListener() {
+            override fun connectionAcquired(call: Call, connection: Connection) {
+                val route = connection.route()
+                directLoopback = pinnedBuffers && call.request().url.scheme == "http" &&
+                    route.proxy.type() == java.net.Proxy.Type.DIRECT &&
+                    route.socketAddress.address?.isLoopbackAddress == true &&
+                    connection.protocol() == Protocol.HTTP_1_1 &&
+                    System.getProperty("java.vendor") == "Eclipse Adoptium" &&
+                    System.getProperty("java.runtime.version") == "27+35"
+                if (!directLoopback) observation?.unproven()
+            }
             override fun requestHeadersStart(call: Call) { outcome(null) }
             override fun canceled(call: Call) { observation?.cancellationObserved() }
             // On fixed HTTP/1.1 bodies this event fires only after the sink closes and the socket is flushed.
@@ -191,11 +209,13 @@ class HttpTransport private constructor(
             override fun responseHeadersEnd(call: Call, response: Response) {
                 outcome(true)
                 status.set(response.code)
-                observation?.headers(response.code)
+                observation?.headers(response.code, directLoopback && response.protocol == Protocol.HTTP_1_1 &&
+                    response.code in 300..399 && response.header("Content-Encoding") == null)
             }
         })
         fun cancel() {
             if (cancelled.compareAndSet(false, true)) {
+                if (status.get() == 0) observation?.unproven()
                 observation?.cancellationRequested()
                 call.cancel()
             }
@@ -206,6 +226,7 @@ class HttpTransport private constructor(
                     continuation.invokeOnCancellation { cancel() }
                     call.enqueue(object : Callback {
                         override fun onFailure(call: Call, e: IOException) {
+                            observation?.unproven()
                             callObservation?.raw(e.javaClass.name)
                             e.message?.let { callObservation?.raw(it) }
                             try {
@@ -246,7 +267,6 @@ class HttpTransport private constructor(
                                 } finally {
                                     try {
                                         response.close()
-                                        observation?.closed()
                                     } finally {
                                         finished.complete(Unit)
                                     }
@@ -290,9 +310,10 @@ class HttpTransport private constructor(
             while (true) {
                 val received = reader.read(chunk, 0, minOf(chunk.size.toLong(), MAX_RESPONSE_BYTES + 1L - buffer.size).toInt())
                 if (received == -1) break
-                observation?.read(received.toLong(), buffer.size, source.buffer)
-                if (buffer.size + received > MAX_RESPONSE_BYTES) {
-                    observation?.emit("limit")
+                bodyRead?.invoke(buffer, source.buffer, received)
+                val overflow = buffer.size + received > MAX_RESPONSE_BYTES
+                observation?.read(received.toLong(), buffer.size, source.buffer, overflow)
+                if (overflow) {
                     cancel()
                     throw ClientException("response_too_large", status, outcomeUnknown = true)
                 }
@@ -328,6 +349,24 @@ private fun httpClient(timeout: Long): OkHttpClient {
     val network = NetworkCounter.current()
     if (timeout !in 1..Int.MAX_VALUE.toLong()) throw ClientException("invalid_timeout")
     return OkHttpClient.Builder()
+        // Responses the library closes before SDK callback handoff are still observed at actual source termination.
+        .addNetworkInterceptor { chain ->
+            val response = chain.proceed(chain.request())
+            val observation = chain.request().tag(TransportObservation::class.java)
+                ?: return@addNetworkInterceptor response
+            val body = response.body
+            val observedSource = object : ForwardingSource(body.source()) {
+                override fun close() {
+                    super.close()
+                    observation.closed()
+                }
+            }.buffer()
+            response.newBuilder().body(object : ResponseBody() {
+                override fun contentType() = body.contentType()
+                override fun contentLength() = body.contentLength()
+                override fun source() = observedSource
+            }).build()
+        }
         .eventListenerFactory { object : EventListener() {
             override fun callStart(call: Call) { network?.entered() }
             override fun dnsStart(call: Call, domainName: String) { network?.entered() }

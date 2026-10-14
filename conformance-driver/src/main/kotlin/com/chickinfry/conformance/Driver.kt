@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 
-private val capabilities = listOf("client.create", "client.copy", "client.call", "session.store", "barrier", "session.trace")
+private val capabilities = listOf("client.create", "client.copy", "client.call", "session.store", "barrier", "session.trace", "client.transport")
 private val common = setOf("caseId", "timeoutMs")
 private fun JsonObject.long(key: String): Long = (get(key) as? JsonPrimitive)?.takeUnless { it.isString }?.longOrNull ?: invalidArgs()
 private fun JsonObject.boolean(key: String): Boolean = (get(key) as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull ?: invalidArgs()
@@ -19,6 +19,7 @@ private fun JsonObject.ref(key: String): String = validReference(string(key))
 internal class Driver(private val fixtures: Fixtures, private val references: References, private val output: OutputStream) {
     private data class Client(val fixture: String, val transport: HttpTransport, val bridge: Bridge, val storeRef: String?)
     private data class Barrier(val caseId: String, val point: String, val participants: Set<String>, val arrived: MutableSet<String> = hashSetOf())
+    private data class ObservedCall(val caseId: String?, val events: MutableList<Pair<Long, CallEvent>> = mutableListOf(), var incomplete: Boolean = false)
     private data class Arrival(val barrierRef: String, val result: CompletableDeferred<JsonObject>)
     private val lock = Any()
     private val writer = Any()
@@ -29,7 +30,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
     private val pending = mutableMapOf<String, Arrival>()
     private val seen = hashSetOf<String>()
     private val running = hashSetOf<String>()
-    private val calls = mutableMapOf<String, MutableList<Pair<Long, CallEvent>>>()
+    private val calls = mutableMapOf<String, ObservedCall>()
     private val flights = IdentityHashMap<Any, String>()
     private val refreshWorkers = mutableMapOf<Job, Long>()
     private val ids = AtomicLong()
@@ -64,7 +65,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
                     respond(id) { handshake(args) }
                 } else {
                     if (command == "handshake") throw DriverFailure("protocol_violation")
-                    if (command == "client.call") synchronized(lock) { calls[id] = mutableListOf() }
+                    if (command == "client.call") synchronized(lock) { calls[id] = ObservedCall((args["caseId"] as? JsonPrimitive)?.takeIf { it.isString }?.content) }
                     synchronized(lock) { running.add(id) }
                     jobs += launch(Dispatchers.Default) {
                         respond(id) {
@@ -181,7 +182,11 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             val inputRefs = args.optionalObject("inputRefs")
             if (input.keys.any { it in inputRefs }) invalidArgs()
             inputRefs.forEach { (field, _) -> input[field] = JsonPrimitive(references.get(inputRefs.ref(field))) }
-            val observation = CallObservation(id) { event -> synchronized(lock) { calls.getValue(id).add(++sequence to event) } }
+            val observation = CallObservation(id) { event -> synchronized(lock) {
+                val call = calls.getValue(id)
+                call.incomplete = call.incomplete || event.readBytes == null || event.retainedBytes == null || event.peakRetainedBytes == null
+                call.events.add(++sequence to event)
+            } }
             references.observeRaw(observation)
             val session = SessionObservation(id, { point -> arrive(id, args.string("caseId"), startedAt, timeout, point) }, { attempt ->
                 client.storeRef?.let { ref -> synchronized(lock) {
@@ -205,15 +210,18 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             val after = args.long("afterSequence")
             if (after < 0) invalidArgs()
             synchronized(lock) {
-                val events = calls[callId] ?: throw DriverFailure("invalid_reference")
+                val call = calls[callId] ?: throw DriverFailure("invalid_reference")
+                if (call.caseId != args.string("caseId")) throw DriverFailure("invalid_reference")
                 if (after > sequence) invalidArgs()
                 buildJsonObject {
-                    put("callId", callId); put("throughSequence", sequence); put("complete", false)
-                    put("events", buildJsonArray { events.filter { it.first > after }.forEach { (number, event) ->
+                    put("callId", callId); put("throughSequence", sequence); put("complete", !call.incomplete)
+                    put("events", buildJsonArray { call.events.filter { it.first > after }.forEach { (number, event) ->
                         add(buildJsonObject {
                             put("sequence", number); put("callId", callId); put("elapsedMs", event.elapsedMs)
                             put("phase", event.phase); put("httpStatus", event.httpStatus?.let(::JsonPrimitive) ?: JsonNull)
-                            put("readBytes", event.readBytes); put("retainedBytes", JsonNull); put("peakRetainedBytes", JsonNull)
+                            put("readBytes", event.readBytes?.let(::JsonPrimitive) ?: JsonNull)
+                            put("retainedBytes", event.retainedBytes?.let(::JsonPrimitive) ?: JsonNull)
+                            put("peakRetainedBytes", event.peakRetainedBytes?.let(::JsonPrimitive) ?: JsonNull)
                         })
                     } })
                 }

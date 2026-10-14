@@ -9,9 +9,9 @@ internal data class CallEvent(
     val phase: String,
     val elapsedMs: Long,
     val httpStatus: Int?,
-    val readBytes: Long,
-    val retainedBytes: Long,
-    val peakRetainedBytes: Long,
+    val readBytes: Long?,
+    val retainedBytes: Long?,
+    val peakRetainedBytes: Long?,
 )
 
 internal class CallObservation(
@@ -19,13 +19,18 @@ internal class CallObservation(
     private val observer: (CallEvent) -> Unit,
 ) : AbstractCoroutineContextElement(Key) {
     companion object Key : CoroutineContext.Key<CallObservation>
-    private val startedAt = System.nanoTime()
-    private var readBytes = 0L
-    private var peak = 0L
-    private var last: Exchange? = null
+    private var startedAt: Long? = null
+    internal var readBytes = 0L
+        private set
+    internal var peak = 0L
+        private set
+    private val exchanges = mutableListOf<Exchange>()
+    private var selected: Exchange? = null
     private var finished = false
+    private var complete = true
     private val rawDetails = mutableListOf<String>()
     private val sent = mutableListOf<String>()
+    @Synchronized fun entered() { if (startedAt == null) startedAt = System.nanoTime() }
     @Synchronized fun transmitted(operation: String) { sent.add(operation) }
     @Synchronized fun transmissions(): List<String> = sent.toList()
     var outcomeUnknown: Boolean? = false
@@ -33,48 +38,102 @@ internal class CallObservation(
     var httpStatus: Int? = null
         private set
 
-    internal inner class Exchange(val deferred: Boolean) {
+    internal data class ResultMetadata(val exchangeId: Any, val event: TransportEvent?, val phases: List<String>)
+
+    internal inner class Exchange(observer: ((TransportEvent) -> Unit)? = null) {
+        val exchangeId = Any()
+        val owner = this@CallObservation
         var event: TransportEvent? = null
         var read = 0L
-        val pending = linkedSetOf<String>()
+        val phases = mutableListOf<String>()
+        val pending = mutableListOf<String>()
+        val transport = TransportObservation { event ->
+            observer?.invoke(event)
+            accept(this, event)
+        }
+        fun metadata(): ResultMetadata = synchronized(owner) { ResultMetadata(exchangeId, event, phases.toList()) }
     }
 
     @Synchronized
-    fun exchange(deferred: Boolean): TransportObservation {
-        val exchange = Exchange(deferred)
-        last = exchange
-        return TransportObservation { event -> accept(exchange, event) }
+    fun exchange(deferred: Boolean, observer: ((TransportEvent) -> Unit)? = null): Exchange = Exchange(observer).also {
+        exchanges += it
+        if (!deferred) selected = it
     }
+
+    @Synchronized
+    fun select(exchange: Exchange?) {
+        selected = exchange
+        selected?.let { flush(it) }
+        outcomeUnknown = selected?.event?.outcomeUnknown
+        httpStatus = selected?.event?.httpStatus
+    }
+
+    fun selectResult(metadata: ResultMetadata?) {
+        synchronized(this) {
+            val exchange = exchanges.firstOrNull { it.exchangeId === metadata?.exchangeId }
+            if (exchange != null || metadata == null) select(exchange) else {
+                selected = Exchange().also {
+                    it.event = metadata.event?.copy(readBytes = 0, retainedBytes = 0, peakRetainedBytes = 0, complete = false)
+                    it.pending += metadata.phases
+                }
+                complete = false
+                selected?.let { flush(it) }
+                outcomeUnknown = selected?.event?.outcomeUnknown
+                httpStatus = selected?.event?.httpStatus
+            }
+        }
+    }
+
+    @Synchronized
+    fun incomplete() { complete = false }
 
     @Synchronized
     private fun accept(exchange: Exchange, event: TransportEvent) {
         readBytes += event.readBytes - exchange.read
         exchange.read = event.readBytes
         exchange.event = event
-        peak = maxOf(peak, event.peakRetainedBytes)
-        if (last === exchange) {
+        complete = complete && event.complete && !finished
+        peak = maxOf(peak, exchanges.sumOf { it.event?.retainedBytes ?: 0 })
+        if (selected === exchange && !finished) {
             outcomeUnknown = event.outcomeUnknown
             httpStatus = event.httpStatus
         }
-        if (event.phase == "completed") return
-        if (event.phase == "read" || event.phase == "limit" || !exchange.deferred) {
-            publish(event.phase, event)
-        } else exchange.pending += event.phase
+        if (event.phase == "completed" || event.phase == "state") return
+        if (event.phase == "limit") return
+        if (!finished && event.phase == "headers" && event.httpStatus in 300..399) selected = exchange
+        if (event.phase == "read") {
+            publish("read", event)
+            if (event.limitReached) {
+                publish("limit", event)
+                if (!finished) {
+                    selected = exchange
+                    flush(exchange)
+                }
+            }
+        } else {
+            exchange.phases += event.phase
+            if (selected === exchange) publish(event.phase, event) else exchange.pending += event.phase
+        }
+    }
+
+    private fun flush(exchange: Exchange) {
+        exchange.pending.forEach { publish(it, exchange.event) }
+        exchange.pending.clear()
     }
 
     @Synchronized
     fun completed() {
         if (finished) return
+        if (exchanges.any { it.event?.httpStatus != null && "reader-closed" !in it.phases }) complete = false
         finished = true
-        last?.let { exchange -> exchange.event?.let { event ->
-            exchange.pending.forEach { publish(it, event) }
-        } }
-        publish("completed", last?.event)
+        publish("completed", selected?.event)
     }
 
     private fun publish(phase: String, event: TransportEvent?) {
-        observer(CallEvent(callId, phase, (System.nanoTime() - startedAt) / 1_000_000,
-            event?.httpStatus, readBytes, if (phase == "completed") 0 else event?.retainedBytes ?: 0, peak))
+        val measured = complete && (event?.complete != false)
+        observer(CallEvent(callId, phase, startedAt?.let { (System.nanoTime() - it) / 1_000_000 } ?: 0,
+            event?.httpStatus, readBytes.takeIf { measured },
+            exchanges.sumOf { it.event?.retainedBytes ?: 0 }.takeIf { measured }, peak.takeIf { measured }))
     }
 
     @Synchronized

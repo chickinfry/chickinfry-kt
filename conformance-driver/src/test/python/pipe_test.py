@@ -55,7 +55,8 @@ def bootstrap(payload, successful):
     if successful:
         response = json.loads(process.stdout.readline())
         assert response['error'] is None
-        assert 'client.transport' not in response['result']['capabilities']
+        assert sorted(response['result']['capabilities']) == sorted(
+            ['client.create', 'client.copy', 'client.call', 'session.store', 'barrier', 'session.trace', 'client.transport'])
     finish(process, successful)
 
 checks = 0

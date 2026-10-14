@@ -49,6 +49,7 @@ internal class WireResponse(val json: JsonObject, val status: Int) {
 private class RefreshFlight {
     val result = CompletableDeferred<WireResponse>()
     val sent = CompletableDeferred<Unit>()
+    var metadata: CallObservation.ResultMetadata? = null
     lateinit var worker: Job
 }
 
@@ -73,12 +74,18 @@ internal suspend fun invokeSession(
     bytes: ByteArray,
     timeoutMillis: Long,
     observation: SessionObservation?,
-    send: suspend (String, ByteArray, String?) -> WireResponse,
+    callObservation: CallObservation?,
+    send: suspend (String, ByteArray, String?, (CallObservation.Exchange?) -> Unit) -> WireResponse,
 ): WireResponse {
     val state = coordination(store)
     val expected = read(store)
+    suspend fun selectedSend(token: String?): WireResponse {
+        var exchange: CallObservation.Exchange? = null
+        try { return send(operation, bytes, token) { exchange = it } }
+        finally { callObservation?.select(exchange) }
+    }
     if (operation == "auth.signup" || operation == "auth.signin") {
-        val response = send(operation, bytes, expected?.accessToken)
+        val response = selectedSend(expected?.accessToken)
         val replacement = response.credentials()
         if (!replace(store, expected, replacement, response.status)) {
             throw ClientException("invalid_token", response.status, outcomeUnknown = true)
@@ -96,19 +103,26 @@ internal suspend fun invokeSession(
         if (token == null || !token.isString || !credentialPattern.matches(token.content)) {
             throw ClientException("invalid_token")
         }
-        return refresh(store, state, expected, token.content, bytes, timeoutMillis, observation, send)
+        return refresh(store, state, expected, token.content, bytes, timeoutMillis, observation, callObservation, send, selectSuccess = true)
     }
     var used = expected
+    var exchange: CallObservation.Exchange? = null
     val response = try {
-        send(operation, bytes, expected?.accessToken)
+        send(operation, bytes, expected?.accessToken) { exchange = it }.also { callObservation?.select(exchange) }
     } catch (failure: OperationError) {
-        if (expected == null || failure.code != "invalid_token" || failure.httpStatus != 401) throw failure
+        if (expected == null || failure.code != "invalid_token" || failure.httpStatus != 401) {
+            callObservation?.select(exchange)
+            throw failure
+        }
         observation?.point?.invoke(SessionPoint("both-originals-rejected", operation, expected))
         val refreshBytes = buildJsonObject { put("refresh_token", expected.refreshToken) }
             .toString().toByteArray(Charsets.UTF_8)
-        val refreshed = refresh(store, state, expected, expected.refreshToken, refreshBytes, timeoutMillis, observation, send)
+        val refreshed = refresh(store, state, expected, expected.refreshToken, refreshBytes, timeoutMillis, observation, callObservation, send)
         used = refreshed.credentials()
-        send(operation, bytes, used.accessToken)
+        selectedSend(used.accessToken)
+    } catch (failure: Throwable) {
+        callObservation?.select(exchange)
+        throw failure
     }
     if (operation == "auth.logout") clear(store, used, observation, response.status)
     return response
@@ -122,7 +136,9 @@ private suspend fun refresh(
     bytes: ByteArray,
     timeoutMillis: Long,
     observation: SessionObservation?,
-    send: suspend (String, ByteArray, String?) -> WireResponse,
+    callObservation: CallObservation?,
+    send: suspend (String, ByteArray, String?, (CallObservation.Exchange?) -> Unit) -> WireResponse,
+    selectSuccess: Boolean = false,
 ): WireResponse {
     val (flight, participated, leader) = state.mutex.withLock {
         if (refreshToken in state.suspended) throw ClientException("invalid_token", outcomeUnknown = true)
@@ -138,10 +154,11 @@ private suspend fun refresh(
                 created.worker = scope.launch(start = CoroutineStart.LAZY) {
                     val startedAt = System.nanoTime()
                     var httpStatus: Int? = null
+                    var exchange: CallObservation.Exchange? = null
                     try {
                         // Deadline and status observation of the send itself stay in the existing transport layer.
-                        val result = if (observation == null) send("auth.refresh", bytes, expected?.accessToken)
-                        else withContext(RefreshTransmission(created.sent)) { send("auth.refresh", bytes, expected?.accessToken) }
+                        val result = if (observation == null) send("auth.refresh", bytes, expected?.accessToken) { exchange = it }
+                        else withContext(RefreshTransmission(created.sent)) { send("auth.refresh", bytes, expected?.accessToken) { exchange = it } }
                         httpStatus = result.status
                         val response = withTimeout(timeoutMillis - (System.nanoTime() - startedAt) / 1_000_000) {
                             val replacement = result.credentials()
@@ -150,6 +167,7 @@ private suspend fun refresh(
                             }
                             result
                         }
+                        created.metadata = exchange?.metadata()
                         created.result.complete(response)
                     } catch (failure: Throwable) {
                         withContext(NonCancellable) {
@@ -174,6 +192,7 @@ private suspend fun refresh(
                                     else -> failure
                                 }
                             }
+                            created.metadata = exchange?.metadata()
                             created.result.completeExceptionally(finalFailure)
                             created.sent.completeExceptionally(finalFailure)
                         }
@@ -189,14 +208,24 @@ private suspend fun refresh(
     }
     if (!leader) observation?.worker?.invoke(flight.worker)
     // Barrier waits belong to the caller; the shared worker only signals transmission.
-    if (leader && observation != null) {
-        flight.sent.await()
-        observation.point.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
+    try {
+        if (leader && observation != null) {
+            flight.sent.await()
+            observation.point.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
+        }
+        if (participated) observation?.point?.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
+        val response = flight.result.await()
+        if (selectSuccess) callObservation?.selectResult(flight.metadata)
+        if (read(store, response.status) != response.credentials()) throw ClientException("invalid_token", response.status)
+        return response
+    } catch (failure: CancellationException) {
+        callObservation?.incomplete()
+        callObservation?.select(null)
+        throw failure
+    } catch (failure: Throwable) {
+        callObservation?.selectResult(flight.metadata)
+        throw failure
     }
-    if (participated) observation?.point?.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
-    val response = flight.result.await()
-    if (read(store, response.status) != response.credentials()) throw ClientException("invalid_token", response.status)
-    return response
 }
 
 private suspend fun read(store: SessionStore, httpStatus: Int? = null): SessionCredentials? = try {
