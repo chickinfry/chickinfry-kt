@@ -14,7 +14,19 @@ kotlin {
             jvmTarget.set(JvmTarget.JVM_1_8)
         }
     }
+    wasmJs {
+        nodejs()
+        compilerOptions {
+            freeCompilerArgs.add("-Xwasm-use-new-exception-proposal")
+        }
+    }
     sourceSets {
+        wasmJsMain.dependencies {
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${rootProject.extra["coroutinesVersion"]}")
+        }
+        wasmJsTest.dependencies {
+            implementation(kotlin("test"))
+        }
         jvmMain.dependencies {
             implementation("com.squareup.okhttp3:okhttp:${rootProject.extra["okhttpVersion"]}")
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${rootProject.extra["coroutinesVersion"]}")
@@ -23,6 +35,12 @@ kotlin {
         jvmTest.dependencies {
             implementation(kotlin("test-junit"))
         }
+    }
+}
+
+rootProject.plugins.withType<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsRootPlugin> {
+    rootProject.extensions.configure<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsEnvSpec> {
+        download.set(false)
     }
 }
 
