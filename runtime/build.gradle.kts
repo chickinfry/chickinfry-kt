@@ -48,6 +48,10 @@ tasks.named<KotlinJvmCompile>("compileKotlinJvm") {
     compilerOptions.freeCompilerArgs.add("-Xjdk-release=8")
 }
 
+tasks.named("check") {
+    dependsOn(":server-test:checkRuntimeStringImports")
+}
+
 tasks.withType<JavaCompile>().configureEach {
     sourceCompatibility = "1.8"
     targetCompatibility = "1.8"

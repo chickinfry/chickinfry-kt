@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.promise
+import kotlinx.coroutines.await
 import kotlin.js.JsAny
 import kotlin.js.JsString
 import kotlin.js.Promise
@@ -13,7 +14,24 @@ import kotlin.js.toJsString
 
 data class User(val id: String)
 data class Session(val id: String, val user: User)
-class Context(val requestId: Double, val method: String, val path: String, val session: Session? = null)
+open class Context(val requestId: Double, val method: String, val path: String, val session: Session? = null) {
+    suspend fun environment(name: String): String? {
+        val text = hostEnvironment("{\"rid\":${requestId.toLong()},\"name\":${jsonValue(name)}}".toJsString()).await().toString()
+        val value = parseInput(text.toJsString()) ?: error("Invalid environment response")
+        if (readString(value, "error".toJsString()) != null) error("Environment binding unavailable")
+        return readString(value, "value".toJsString())?.toString()
+    }
+    suspend fun log(message: String, level: String = "info") {
+        require(level in listOf("debug", "info", "warn", "error"))
+        check(hostLog("{\"rid\":${requestId.toLong()},\"level\":${jsonValue(level)},\"message\":${jsonValue(message)}}".toJsString()).await().toString() == "{}")
+    }
+}
+
+@JsFun("(text) => globalThis.__chik.env(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
+private external fun hostEnvironment(text: JsString): Promise<JsString>
+
+@JsFun("(text) => globalThis.__chik.log(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
+private external fun hostLog(text: JsString): Promise<JsString>
 
 private class OperationError(val status: Int, val code: String) : Exception()
 

@@ -13,6 +13,8 @@ dependencyResolutionManagement {
 
 rootProject.name = "chickinfry"
 include(":runtime")
+include(":server-test")
+project(":server-test").projectDir = file("tests/server")
 
 include(":conformance-driver")
 val sdkProperties = mapOf(

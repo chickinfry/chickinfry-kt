@@ -50,3 +50,46 @@ separate runtime classloaders does not coordinate refresh. Suspension is kept in
 memory while the store object lives and is not restored after process restart.
 Persistent implementations need their own policy for that boundary; this runtime
 does not provide a recovery command or a disk/Keystore implementation.
+
+## Kotlin server: unsupported text functions
+
+Some Kotlin text functions cannot run in Chickinfry servers yet. If the server
+build needs them, Chickinfry rejects it before starting or deploying it. Replace
+the calls and rebuild; changing your handler's inputs does not fix the build.
+This restriction applies to Kotlin/Wasm servers, not the JVM client transport.
+
+| Function | Alternative |
+| --- | --- |
+| `padStart` | Add string prefixes in a loop, as in `padWithZeros` below. |
+| `lowercase`, `uppercase` | For an ASCII-only domain, map letters using string slices. Use the opposite alphabet/range for uppercase. This does not replace Unicode case conversion. |
+| `Regex` | For fixed formats, check length, separators, character ranges and numeric bounds directly. Keep every validation rule. |
+| `StringBuilder.append(Char)` | Append a string slice: `builder.append(text.substring(index, index + 1))`. String append and concatenation remain usable. |
+
+```kotlin
+fun padWithZeros(value: String, width: Int): String {
+    var result = value
+    while (result.length < width) result = "0" + result
+    return result
+}
+
+fun asciiLowercase(value: String): String = buildString {
+    require(value.all { it.code < 128 })
+    val alphabet = "abcdefghijklmnopqrstuvwxyz"
+    for (index in value.indices) {
+        val char = value[index]
+        append(if (char in 'A'..'Z') alphabet.substring(char - 'A', char - 'A' + 1)
+            else value.substring(index, index + 1))
+    }
+}
+```
+
+The server build checks these prefix and ASCII-lowercase examples along with its
+database runtime. The runtime uses fixed-format validation for dates, timestamps
+and UUIDs, including calendar and offset bounds.
+
+Standard map and set construction can also retain unsupported text functions
+through the collections' default formatting, even without an explicit `toString`
+call. Generated database code avoids those paths internally. Keep application
+logic on the generated typed rows and repositories; a custom collection or text
+operation can still make a server build fail. These alternatives do not establish
+support for other standard-library text functions.
