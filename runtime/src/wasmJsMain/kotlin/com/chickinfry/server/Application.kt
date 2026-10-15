@@ -3,8 +3,10 @@
 package com.chickinfry.server
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.promise
 import kotlinx.coroutines.await
 import kotlin.js.JsAny
@@ -12,9 +14,8 @@ import kotlin.js.JsString
 import kotlin.js.Promise
 import kotlin.js.toJsString
 
-data class User(val id: String)
-data class Session(val id: String, val user: User)
-open class Context(val requestId: Double, val method: String, val path: String, val session: Session? = null) {
+/** Kotlin server targets do not support platform authentication yet; the context carries no session. */
+open class Context(val requestId: Double, val method: String, val path: String) {
     suspend fun environment(name: String): String? {
         val text = hostEnvironment("{\"rid\":${requestId.toLong()},\"name\":${jsonValue(name)}}".toJsString()).await().toString()
         val value = parseInput(text.toJsString()) ?: error("Invalid environment response")
@@ -33,10 +34,12 @@ private external fun hostEnvironment(text: JsString): Promise<JsString>
 @JsFun("(text) => globalThis.__chik.log(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
 private external fun hostLog(text: JsString): Promise<JsString>
 
-private class OperationError(val status: Int, val code: String) : Exception()
-
-fun requireSession(context: Context): Session =
-    context.session ?: throw OperationError(401, "unauthenticated")
+/** An explicit operation failure. Only HTTP client and server error statuses are accepted. */
+class OperationError(val code: String, val status: Int) : Exception() {
+    init {
+        require(status in 400..599) { "Operation error status must be between 400 and 599." }
+    }
+}
 
 external interface JsonObject : JsAny
 
@@ -68,7 +71,7 @@ private external fun utf8Size(value: JsString): Int
 private external fun envelope(status: Int, body: JsonObject): JsString
 
 fun requiredString(input: JsonObject, name: String): String =
-    readString(input, name.toJsString())?.toString() ?: throw OperationError(400, "invalid_input")
+    readString(input, name.toJsString())?.toString() ?: throw OperationError("invalid_input", 400)
 
 class JsonObjectBuilder {
     internal val value: JsonObject = newObject()
@@ -83,28 +86,44 @@ class JsonObjectBuilder {
 fun buildJsonObject(block: JsonObjectBuilder.() -> Unit): JsonObject =
     JsonObjectBuilder().apply(block).value
 
+/** One application per host cold-start generation; a new generation must create a new application. */
 class Application(
     private val accepts: (String) -> Boolean,
+    setup: suspend () -> Unit = {},
     private val dispatch: suspend (Context, JsonObject) -> JsonObject,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val initialization = scope.async(start = CoroutineStart.LAZY) { setup() }
+
+    /**
+     * Completes setup before the host marks this generation ready. Failures, including setup cancellation,
+     * are retained. Cancelling a caller only stops its wait; the host owns generation replacement.
+     */
+    suspend fun initialize() {
+        initialization.await()
+    }
 
     fun handle(
         rid: Double, method: String, path: String, contentType: String,
         authorization: String, body: String, byteLength: Int,
     ): Promise<JsString> = scope.promise {
+        try {
+            initialize()
+        } catch (_: Throwable) {
+            return@promise envelope(500, buildJsonObject { put("error", "operation_failed") })
+        }
         val response = try {
             if (method != "POST" || !path.startsWith("/") || !accepts(path.substring(1))) {
-                throw OperationError(404, "not_found")
+                throw OperationError("not_found", 404)
             }
             if (!isJsonContentType(contentType.toJsString())) {
-                throw OperationError(415, "unsupported_media_type")
+                throw OperationError("unsupported_media_type", 415)
             }
             if (byteLength > 4 * 1024 * 1024 || utf8Size(body.toJsString()) > 4 * 1024 * 1024) {
-                throw OperationError(413, "request_too_large")
+                throw OperationError("request_too_large", 413)
             }
-            if (authorization.isNotEmpty()) throw OperationError(401, "invalid_token")
-            val input = parseInput(body.toJsString()) ?: throw OperationError(400, "invalid_input")
+            if (authorization.isNotEmpty()) throw OperationError("invalid_token", 401)
+            val input = parseInput(body.toJsString()) ?: throw OperationError("invalid_input", 400)
             envelope(200, dispatch(Context(rid, method, path), input))
         } catch (error: OperationError) {
             envelope(error.status, buildJsonObject { put("error", error.code) })
