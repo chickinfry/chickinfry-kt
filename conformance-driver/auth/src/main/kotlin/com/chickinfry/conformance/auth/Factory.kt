@@ -27,15 +27,6 @@ private class TypedBridge(private val client: Client) : Bridge {
                 add(buildJsonObject { put("id", row.id); put("wire_value", row.wireValue); put("observed_at", row.observedAt) })
             } }) }
         }
-        "auth.identity" -> {
-            input.fields(setOf("credential", "provider"))
-            val output = client.auth.identity(AuthIdentityInput(input.string("credential"), input.string("provider")))
-            buildJsonObject {
-                put("access_token", output.accessToken); put("refresh_token", output.refreshToken)
-                put("expires_at", output.expiresAt); put("refresh_expires_at", output.refreshExpiresAt)
-                put("user_id", output.userId); put("session_id", output.sessionId)
-            }
-        }
         "auth.refresh" -> {
             input.fields(setOf("refresh_token"))
             val output = client.auth.refresh(AuthRefreshInput(input.string("refresh_token")))
