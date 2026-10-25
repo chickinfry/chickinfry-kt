@@ -10,7 +10,7 @@ are direct generated method calls, never reflective dispatch.
 Generate both fixtures with the product CLI first. Supply their generated Kotlin
 module directories using `chickinfry.conformance.plainSdk` and
 `chickinfry.conformance.authSdk`. The property mapping is centralized in
-`settings.gradle.kts`; these names await coordinator integration. Generated
+`settings.gradle.kts`. Generated
 sources are neither copied into this repository nor edited.
 
 ```sh
