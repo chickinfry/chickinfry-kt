@@ -48,6 +48,79 @@ external interface JsonObject : JsAny
 @JsFun("(text) => { try { const value = JSON.parse(text); return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null; } catch { return null; } }")
 private external fun parseInput(text: JsString): JsonObject?
 
+// A holder keeps "not JSON" (null) apart from "JSON but not an object", which map to different error codes.
+@JsFun("(text) => { try { return { value: JSON.parse(text) }; } catch { return null; } }")
+private external fun parseRequestJson(text: JsString): JsAny?
+
+@JsFun("(holder) => { const value = holder.value; return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null; }")
+private external fun requestObject(holder: JsAny): JsonObject?
+
+// Scalars are checked in place and only containers are stacked, so a large flat array allocates nothing per item.
+@JsFun("""(input) => {
+    const containers = [input];
+    const depths = [1];
+    const scalarValid = (value) => typeof value === 'number' ? Number.isFinite(value)
+        : typeof value === 'string' ? value.isWellFormed() : true;
+    const visit = (child, depth) => {
+        if (child !== null && typeof child === 'object') {
+            containers.push(child);
+            depths.push(depth);
+            return true;
+        }
+        return scalarValid(child);
+    };
+    while (containers.length > 0) {
+        const value = containers.pop();
+        const depth = depths.pop();
+        if (depth > 64) return false;
+        if (Array.isArray(value)) {
+            for (let i = 0; i < value.length; i++) if (!visit(value[i], depth + 1)) return false;
+        } else {
+            for (const key in value) {
+                if (!Object.hasOwn(value, key)) continue;
+                if (!key.isWellFormed() || !visit(value[key], depth + 1)) return false;
+            }
+        }
+    }
+    return true;
+}""")
+private external fun validInputStructure(input: JsonObject): Boolean
+
+// JSON.parse keeps only the last duplicate, so duplicates are found in the source text. The text has
+// already parsed, so a string token always ends at the first unescaped quote. Keys compare decoded.
+// Containers deeper than 64 are invalid anyway, so the scan stops there instead of holding a Set per level.
+@JsFun("""(text) => {
+    const stack = [];
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"') {
+            let j = i + 1;
+            while (text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+            const top = stack[stack.length - 1];
+            if (top !== undefined && top.keys !== null && top.expectKey) {
+                const key = JSON.parse(text.slice(i, j + 1));
+                if (top.keys.has(key)) return false;
+                top.keys.add(key);
+                top.expectKey = false;
+            }
+            i = j;
+        } else if (c === '{') {
+            if (stack.length >= 64) return false;
+            stack.push({ keys: new Set(), expectKey: true });
+        } else if (c === '[') {
+            if (stack.length >= 64) return false;
+            stack.push({ keys: null, expectKey: false });
+        } else if (c === '}' || c === ']') {
+            stack.pop();
+        } else if (c === ',') {
+            const top = stack[stack.length - 1];
+            if (top !== undefined && top.keys !== null) top.expectKey = true;
+        }
+    }
+    return true;
+}""")
+private external fun uniqueObjectKeys(text: JsString): Boolean
+
 @JsFun("(input, name) => typeof input[name] === 'string' && Object.hasOwn(input, name) ? input[name] : null")
 private external fun readString(input: JsonObject, name: JsString): JsString?
 
@@ -181,7 +254,10 @@ class Application(
                 throw OperationError("request_too_large", 413)
             }
             if (authorization.isNotEmpty()) throw OperationError("invalid_token", 401)
-            val input = parseInput(body.toJsString()) ?: throw OperationError("invalid_input", 400)
+            val text = body.toJsString()
+            val parsed = parseRequestJson(text) ?: throw OperationError("invalid_json", 400)
+            val input = requestObject(parsed) ?: throw OperationError("invalid_input", 400)
+            if (!uniqueObjectKeys(text) || !validInputStructure(input)) throw OperationError("invalid_input", 400)
             envelope(200, dispatch(Context(rid, method, path), input))
         } catch (error: OperationError) {
             envelope(error.status, buildJsonObject { put("error", error.code) })

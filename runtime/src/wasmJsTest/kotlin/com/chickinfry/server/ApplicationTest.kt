@@ -165,6 +165,65 @@ class ApplicationTest {
     }
 
     @Test
+    fun requestContainerDepthIsCheckedBeforeDispatch(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        fun nested(containers: Int): String = buildString {
+            for (index in containers - 1 downTo 0) append(if (index % 2 == 0) "{\"child\":" else "[")
+            append("null")
+            repeat(containers) { index -> append(if (index % 2 == 0) "}" else "]") }
+        }
+        val cases = listOf(
+            "{\"ignored\":${nested(63)}}" to 200,
+            "{\"ignored\":${nested(64)}}" to 400,
+            "{\"rows\":[{\"payload\":\"present\",\"ignored\":${nested(61)}}]}" to 200,
+            "{\"rows\":[{\"payload\":\"present\",\"ignored\":${nested(62)}}]}" to 400,
+            "{\"ignored\":${nested(19999)}}" to 400,
+        )
+        for (usesBudget in listOf(false, true)) {
+            for ((body, status) in cases) {
+                var calls = 0
+                val app = Application({ true }) { _, input ->
+                    calls++
+                    if (usesBudget) InputBudget(input)
+                    if (hasField(input, "rows")) {
+                        for (row in requiredObjectList(input, "rows")) requiredString(row, "payload")
+                    }
+                    buildJsonObject {}
+                }
+                val expected = if (status == 200) "{\"status\":200,\"body\":{}}"
+                    else "{\"status\":400,\"body\":{\"error\":\"invalid_input\"}}"
+                assertEquals(expected, app.request(body = body), "budget=$usesBudget, bytes=${body.length}")
+                assertEquals(if (status == 200) 1 else 0, calls)
+            }
+        }
+        "passed".toJsString()
+    }
+
+    @Test
+    fun requestNumbersMustBeFiniteBeforeDispatch(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        val cases = listOf(
+            "{\"ignored\":1e999}" to 400,
+            "{\"rows\":[{\"ignored\":-1e999}]}" to 400,
+            "{\"ignored\":[1e999]}" to 400,
+            "{\"ignored\":1e308}" to 200,
+        )
+        for (usesBudget in listOf(false, true)) {
+            for ((body, status) in cases) {
+                var calls = 0
+                val app = Application({ true }) { _, input ->
+                    calls++
+                    if (usesBudget) InputBudget(input)
+                    buildJsonObject {}
+                }
+                val expected = if (status == 200) "{\"status\":200,\"body\":{}}"
+                    else "{\"status\":400,\"body\":{\"error\":\"invalid_input\"}}"
+                assertEquals(expected, app.request(body = body), "budget=$usesBudget, body=$body")
+                assertEquals(if (status == 200) 1 else 0, calls)
+            }
+        }
+        "passed".toJsString()
+    }
+
+    @Test
     fun explicitOperationErrorsPreserveCodeAndStatus(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
         for (status in listOf(400, 401, 409, 422, 500, 501, 503, 599)) {
             val code = if (status == 501) "not_implemented" else "business_failure"
@@ -349,6 +408,59 @@ class ApplicationTest {
             assertEquals(expected, result)
         }
         assertEquals(2, calls)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun malformedJsonIsInvalidJsonRegardlessOfDepth(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        var calls = 0
+        val app = Application({ true }) { _, _ ->
+            calls++
+            buildJsonObject {}
+        }
+        val invalidJson = "{\"status\":400,\"body\":{\"error\":\"invalid_json\"}}"
+        val invalidInput = "{\"status\":400,\"body\":{\"error\":\"invalid_input\"}}"
+        assertEquals(invalidJson, app.request(body = "{\"ignored\":" + "[".repeat(65)))
+        assertEquals(invalidJson, app.request(body = "{\"ignored\":" + "[".repeat(65) + "x"))
+        assertEquals(invalidJson, app.request(body = "{"))
+        assertEquals(invalidInput, app.request(body = "[]"))
+        assertEquals(invalidInput, app.request(body = "1"))
+        assertEquals(0, calls)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun requestBodiesFollowIJson(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        var calls = 0
+        val app = Application({ true }) { _, _ ->
+            calls++
+            buildJsonObject {}
+        }
+        val invalidInput = "{\"status\":400,\"body\":{\"error\":\"invalid_input\"}}"
+        val accepted = "{\"status\":200,\"body\":{}}"
+        val deep = "[".repeat(20000) + "]".repeat(20000)
+        for (body in listOf(
+            "{\"a\":1,\"a\":2}",
+            "{\"a\":1,\"\\u0061\":2}",
+            "{\"rows\":[{\"b\":1},{\"b\":1,\"b\":2}]}",
+            "{\"ignored\":$deep,\"ignored\":0}",
+            "{\"ignored\":1e999,\"ignored\":0}",
+            "{\"a\":\"\\uD800\"}",
+            "{\"\\uDC00\":1}",
+            "{\"a\":1" + "0".repeat(309) + "}",
+        )) {
+            assertEquals(invalidInput, app.request(body = body))
+        }
+        assertEquals(0, calls)
+        for (body in listOf(
+            "{\"a\":{\"b\":1},\"c\":{\"b\":1}}",
+            "{\"a\":\"\\uD83D\\uDE00\"}",
+            "{\"a\":12345678901234567890123}",
+            "{\"a\":\"\\\"b\\\":1,\\\"b\\\"\"}",
+        )) {
+            assertEquals(accepted, app.request(body = body))
+        }
+        assertEquals(4, calls)
         "passed".toJsString()
     }
 }
