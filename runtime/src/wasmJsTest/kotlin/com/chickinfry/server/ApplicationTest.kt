@@ -140,7 +140,7 @@ class ApplicationTest {
     }
 
     @Test
-    fun budgetChecksReserializedSizeOnlyWhenAddingDefaults(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+    fun budgetChecksReserializedSizeBeforeAddingDefaults(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
         var calls = 0
         val app = Application({ true }) { _, input ->
             val budget = InputBudget(input)
@@ -148,13 +148,19 @@ class ApplicationTest {
             calls++
             buildJsonObject {}
         }
-        // Compact exponent notation fits on the wire but expands past 4 MiB when serialized.
-        val numbers = "1e9,".repeat(499999) + "1e9"
-        val present = "{\"existing\":\"kept\",\"unknown\":[" + numbers + "]}"
-        assertTrue(present.length < 4194304)
-        assertEquals("{\"status\":200,\"body\":{}}", app.request(body = present))
-        assertEquals("{\"status\":413,\"body\":{\"error\":\"request_too_large\"}}", app.request(body = "{\"unknown\":[" + numbers + "]}"))
-        assertEquals(1, calls)
+        // The ignored number expands by 17 bytes; all defaulted fields are already present.
+        val present = "{\"existing\":\"" + "x".repeat(4194258) + "\",\"ignored\":1e20}"
+        assertEquals(4194288, present.length)
+        assertEquals("{\"status\":413,\"body\":{\"error\":\"request_too_large\"}}", app.request(body = present))
+        assertEquals(0, calls)
+        val below = "{\"existing\":\"" + "x".repeat(4194256) + "\",\"ignored\":1e20}"
+        assertEquals(4194286, below.length)
+        assertEquals("{\"status\":200,\"body\":{}}", app.request(body = below))
+        // One less padding byte makes the reserialized object exactly 4 MiB.
+        val boundary = "{\"existing\":\"" + "x".repeat(4194257) + "\",\"ignored\":1e20}"
+        assertEquals(4194287, boundary.length)
+        assertEquals("{\"status\":200,\"body\":{}}", app.request(body = boundary))
+        assertEquals(2, calls)
         "passed".toJsString()
     }
 

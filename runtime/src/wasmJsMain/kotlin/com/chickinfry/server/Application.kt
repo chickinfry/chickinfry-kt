@@ -109,12 +109,13 @@ fun requiredObjectList(input: JsonObject, name: String): List<JsonObject> {
     }
 }
 
-@JsFun("(input) => ({ size: new TextEncoder().encode(JSON.stringify(input)).byteLength, counts: new WeakMap() })")
-private external fun newInputBudget(input: JsonObject): JsAny
+@JsFun("(input, limit) => { const size = new TextEncoder().encode(JSON.stringify(input)).byteLength; return size > limit ? null : { size, counts: new WeakMap() }; }")
+private external fun newInputBudget(input: JsonObject, limit: Int): JsAny?
 
 /** A byte budget shared by all generated field decoders for one request, including nested defaults. */
 class InputBudget(input: JsonObject) {
-    internal val value: JsAny = newInputBudget(input)
+    internal val value: JsAny = newInputBudget(input, MAX_INPUT_BYTES)
+        ?: throw OperationError("request_too_large", 413)
 }
 
 @JsFun("(input, name, literal, budget, limit) => { const count = budget.counts.get(input) ?? Object.keys(input).length; budget.size += new TextEncoder().encode(JSON.stringify(name)).byteLength + 1 + (count > 0 ? 1 : 0) + new TextEncoder().encode(literal).byteLength; if (budget.size > limit) return null; budget.counts.set(input, count + 1); return { [name]: JSON.parse(literal) }; }")
