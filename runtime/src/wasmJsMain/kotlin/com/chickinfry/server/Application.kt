@@ -41,6 +41,8 @@ class OperationError(val code: String, val status: Int) : Exception() {
     }
 }
 
+private const val MAX_INPUT_BYTES = 4 * 1024 * 1024
+
 external interface JsonObject : JsAny
 
 @JsFun("(text) => { try { const value = JSON.parse(text); return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null; } catch { return null; } }")
@@ -69,6 +71,61 @@ private external fun utf8Size(value: JsString): Int
 
 @JsFun("(status, body) => JSON.stringify({ status, body })")
 private external fun envelope(status: Int, body: JsonObject): JsString
+
+/** Returns whether the input owns the wire key, including keys whose value is null. */
+fun hasField(input: JsonObject, name: String): Boolean = hasField(input, name.toJsString())
+
+@JsFun("(input, name) => Object.hasOwn(input, name) && input[name] === null")
+private external fun fieldIsNull(input: JsonObject, name: JsString): Boolean
+
+/** Tests explicit JSON null without treating absent or undefined values as null. */
+fun isNull(input: JsonObject, name: String): Boolean = fieldIsNull(input, name.toJsString())
+
+@JsFun("(input, name) => Object.hasOwn(input, name) && Array.isArray(input[name]) ? input[name] : null")
+private external fun readArray(input: JsonObject, name: JsString): JsAny?
+
+@JsFun("(array) => array.length")
+private external fun arraySize(array: JsAny): Int
+
+@JsFun("(array, index) => Object.hasOwn(array, index) && typeof array[index] === 'string' ? array[index] : null")
+private external fun arrayString(array: JsAny, index: Int): JsString?
+
+@JsFun("(array, index) => { const value = array[index]; return Object.hasOwn(array, index) && value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null; }")
+private external fun arrayObject(array: JsAny, index: Int): JsonObject?
+
+/** Reads a string array without coercing null, absent, or non-string values. */
+fun requiredStringList(input: JsonObject, name: String): List<String> {
+    val array = readArray(input, name.toJsString()) ?: throw OperationError("invalid_input", 400)
+    return List(arraySize(array)) { index ->
+        arrayString(array, index)?.toString() ?: throw OperationError("invalid_input", 400)
+    }
+}
+
+/** Reads non-null object items; generated decoders validate each item's declared fields. */
+fun requiredObjectList(input: JsonObject, name: String): List<JsonObject> {
+    val array = readArray(input, name.toJsString()) ?: throw OperationError("invalid_input", 400)
+    return List(arraySize(array)) { index ->
+        arrayObject(array, index) ?: throw OperationError("invalid_input", 400)
+    }
+}
+
+@JsFun("(input) => ({ size: new TextEncoder().encode(JSON.stringify(input)).byteLength, counts: new WeakMap() })")
+private external fun newInputBudget(input: JsonObject): JsAny
+
+/** A byte budget shared by all generated field decoders for one request, including nested defaults. */
+class InputBudget(input: JsonObject) {
+    internal val value: JsAny = newInputBudget(input)
+}
+
+@JsFun("(input, name, literal, budget, limit) => { const count = budget.counts.get(input) ?? Object.keys(input).length; budget.size += new TextEncoder().encode(JSON.stringify(name)).byteLength + 1 + (count > 0 ? 1 : 0) + new TextEncoder().encode(literal).byteLength; if (budget.size > limit) return null; budget.counts.set(input, count + 1); return { [name]: JSON.parse(literal) }; }")
+private external fun defaultField(input: JsonObject, name: JsString, literal: JsString, budget: JsAny, limit: Int): JsonObject?
+
+/** Supplies a fresh compiler-validated JSON literal only for an absent key; read the field from the result. */
+fun withDefault(input: JsonObject, name: String, literal: String, budget: InputBudget): JsonObject {
+    if (hasField(input, name)) return input
+    return defaultField(input, name.toJsString(), literal.toJsString(), budget.value, MAX_INPUT_BYTES)
+        ?: throw OperationError("request_too_large", 413)
+}
 
 fun requiredString(input: JsonObject, name: String): String =
     readString(input, name.toJsString())?.toString() ?: throw OperationError("invalid_input", 400)
@@ -119,7 +176,7 @@ class Application(
             if (!isJsonContentType(contentType.toJsString())) {
                 throw OperationError("unsupported_media_type", 415)
             }
-            if (byteLength > 4 * 1024 * 1024 || utf8Size(body.toJsString()) > 4 * 1024 * 1024) {
+            if (byteLength > MAX_INPUT_BYTES || utf8Size(body.toJsString()) > MAX_INPUT_BYTES) {
                 throw OperationError("request_too_large", 413)
             }
             if (authorization.isNotEmpty()) throw OperationError("invalid_token", 401)

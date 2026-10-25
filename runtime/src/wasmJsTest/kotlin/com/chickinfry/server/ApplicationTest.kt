@@ -19,9 +19,145 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 import kotlin.test.assertSame
 
 class ApplicationTest {
+    @Test
+    fun ownKeysDistinguishNullFromAbsentAndUndefined() {
+        val input = presenceFixture()
+        assertFalse(hasField(input, "missing"))
+        assertFalse(hasField(input, "inherited"))
+        assertFalse(isNull(input, "missing"))
+        assertFalse(isNull(input, "inherited"))
+        assertTrue(hasField(input, "undefined"))
+        assertFalse(isNull(input, "undefined"))
+        assertTrue(hasField(input, "cleared"))
+        assertTrue(isNull(input, "cleared"))
+        assertFalse(isNull(input, "text"))
+        assertEquals("null", requiredString(input, "text"))
+        assertTrue(hasField(input, "hasOwnProperty"))
+        val budget = InputBudget(input)
+        assertSame(input, withDefault(input, "undefined", "\"fallback\"", budget))
+        val defaultNull = withDefault(input, "missing", "null", budget)
+        assertTrue(hasField(defaultNull, "missing"))
+        assertTrue(isNull(defaultNull, "missing"))
+        for (name in listOf("missing", "inherited", "undefined", "cleared")) {
+            assertEquals(400, assertFailsWith<OperationError> { requiredString(input, name) }.status)
+        }
+    }
+
+    @Test
+    fun defaultsOnlyReplaceAbsentKeys(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        var calls = 0
+        val app = Application({ true }) { _, input ->
+            val budget = InputBudget(input)
+            val textInput = withDefault(input, "text", "\"fallback\"", budget)
+            val text = if (isNull(textInput, "text")) null else requiredString(textInput, "text")
+            val strict = requiredString(withDefault(input, "strict", "\"strict default\"", budget), "strict")
+            calls++
+            buildJsonObject { put("text", text ?: "<null>"); put("strict", strict) }
+        }
+        for ((body, expected) in listOf(
+            "{}" to "fallback",
+            "{\"text\":null}" to "<null>",
+            "{\"text\":\"\"}" to "",
+            "{\"text\":\"null\"}" to "null",
+            "{\"text\":\"value\"}" to "value",
+        )) {
+            assertEquals("{\"status\":200,\"body\":{\"text\":\"$expected\",\"strict\":\"strict default\"}}", app.request(body = body))
+        }
+        for (body in listOf("{\"strict\":null}", "{\"strict\":42}", "{\"text\":false}", "{\"text\":[]}", "{\"text\":{}}")) {
+            assertEquals("{\"status\":400,\"body\":{\"error\":\"invalid_input\"}}", app.request(body = body))
+        }
+        assertEquals(5, calls)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun listsValidateEveryItemBeforeCallingTheService(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        var calls = 0
+        val app = Application({ true }) { _, input ->
+            val budget = InputBudget(input)
+            val rowsInput = withDefault(input, "rows", "[{\"children\":[{\"tags\":[\"default\"]}]}]", budget)
+            val rows = requiredObjectList(rowsInput, "rows").flatMap { row ->
+                requiredObjectList(row, "children").flatMap { child -> requiredStringList(child, "tags") }
+            }.toMutableList()
+            val result = rows.joinToString("|")
+            rows.clear()
+            if (!hasField(input, "rows")) corruptDefault(rowsInput)
+            calls++
+            buildJsonObject { put("result", result) }
+        }
+        for ((body, expected) in listOf(
+            "{}" to "default",
+            "{}" to "default",
+            "{\"rows\":[]}" to "",
+            "{\"rows\":[{\"children\":[{\"tags\":[\"\",\"null\",\"ok\"]}]}]}" to "|null|ok",
+        )) {
+            assertEquals("{\"status\":200,\"body\":{\"result\":\"$expected\"}}", app.request(body = body))
+        }
+        for (body in listOf(
+            "{\"rows\":null}", "{\"rows\":{}}", "{\"rows\":[null]}", "{\"rows\":[{\"children\":[]},null]}", "{\"rows\":[1]}", "{\"rows\":[[]]}",
+            "{\"rows\":[{}]}", "{\"rows\":[{\"children\":null}]}",
+            "{\"rows\":[{\"children\":[{\"tags\":null}]}]}",
+            "{\"rows\":[{\"children\":[{\"tags\":\"x\"}]}]}",
+            "{\"rows\":[{\"children\":[{\"tags\":[\"valid\",null]}]}]}",
+            "{\"rows\":[{\"children\":[{\"tags\":[42]}]}]}",
+        )) {
+            assertEquals("{\"status\":400,\"body\":{\"error\":\"invalid_input\"}}", app.request(body = body))
+        }
+        assertEquals(4, calls)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun defaultsShareOneRequestByteBudget(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        var calls = 0
+        val app = Application({ true }) { _, input ->
+            val budget = InputBudget(input)
+            val size = requiredString(input, "size").toInt()
+            val padding = "x".repeat(size)
+            val literal = "\"" + padding + "\""
+            requiredString(withDefault(input, "first", literal, budget), "first")
+            requiredString(withDefault(input, "next", literal, budget), "next")
+            calls++
+            buildJsonObject {}
+        }
+        // The expanded object occupies exactly 4 MiB, including field names and separators.
+        assertEquals("{\"status\":200,\"body\":{}}", app.request(body = "{\"size\":\"02097132\"}"))
+        assertEquals("{\"status\":413,\"body\":{\"error\":\"request_too_large\"}}", app.request(body = "{\"size\":\"02097133\"}"))
+        assertEquals(1, calls)
+        val nested = Application({ true }) { _, input ->
+            val budget = InputBudget(input)
+            for (row in requiredObjectList(input, "rows")) {
+                requiredString(withDefault(row, "text", "\"" + "é".repeat(1048576) + "\"", budget), "text")
+            }
+            buildJsonObject {}
+        }
+        assertEquals("{\"status\":413,\"body\":{\"error\":\"request_too_large\"}}", nested.request(body = "{\"rows\":[{},{}]}"))
+        "passed".toJsString()
+    }
+
+    @Test
+    fun budgetChecksReserializedSizeOnlyWhenAddingDefaults(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        var calls = 0
+        val app = Application({ true }) { _, input ->
+            val budget = InputBudget(input)
+            requiredString(withDefault(input, "existing", "\"fallback\"", budget), "existing")
+            calls++
+            buildJsonObject {}
+        }
+        // Compact exponent notation fits on the wire but expands past 4 MiB when serialized.
+        val numbers = "1e9,".repeat(499999) + "1e9"
+        val present = "{\"existing\":\"kept\",\"unknown\":[" + numbers + "]}"
+        assertTrue(present.length < 4194304)
+        assertEquals("{\"status\":200,\"body\":{}}", app.request(body = present))
+        assertEquals("{\"status\":413,\"body\":{\"error\":\"request_too_large\"}}", app.request(body = "{\"unknown\":[" + numbers + "]}"))
+        assertEquals(1, calls)
+        "passed".toJsString()
+    }
+
     @Test
     fun explicitOperationErrorsPreserveCodeAndStatus(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
         for (status in listOf(400, 401, 409, 422, 500, 501, 503, 599)) {
@@ -211,5 +347,11 @@ class ApplicationTest {
     }
 }
 
-private suspend fun Application.request(authorization: String = ""): String =
-    handle(1.0, "POST", "/greeting.echo", "application/json", authorization, "{}", 2).await().toString()
+@JsFun("() => Object.assign(Object.create({ inherited: 'inherited' }), { undefined: undefined, cleared: null, text: 'null', hasOwnProperty: 'value' })")
+private external fun presenceFixture(): JsonObject
+
+@JsFun("(input) => { input.rows[0].children[0].tags[0] = 'changed'; }")
+private external fun corruptDefault(input: JsonObject)
+
+private suspend fun Application.request(authorization: String = "", body: String = "{}"): String =
+    handle(1.0, "POST", "/greeting.echo", "application/json", authorization, body, 0).await().toString()

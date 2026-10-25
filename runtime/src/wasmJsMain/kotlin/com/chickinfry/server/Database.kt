@@ -20,7 +20,7 @@ private external fun parseDatabase(text: JsString): JsonObject
 private external fun fieldCount(value: JsonObject): Int
 
 @JsFun("(value, name) => Object.hasOwn(value, name)")
-private external fun hasField(value: JsonObject, name: JsString): Boolean
+internal external fun hasField(value: JsonObject, name: JsString): Boolean
 
 @JsFun("(value, name) => { const item = value[name]; return typeof item === 'string' ? item : null; }")
 private external fun databaseString(value: JsonObject, name: JsString): JsString?
