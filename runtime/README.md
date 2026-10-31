@@ -17,7 +17,7 @@ from a coroutine; an empty store is rejected with `ClientError("unauthenticated"
 and no HTTP status. Store-read failures use `failed_precondition` unless the
 store already throws a `ClientError`.
 
-Pass `signedIn` to the generated SDK's `Client` constructor. Successful
+Pass `signedIn` to the generated SDK's `createClient(signedIn)` function. Successful
 `auth.signup`, `auth.signin`, and `auth.refresh` responses are stored atomically.
 Subsequent calls use the current access token; successful `auth.logout` clears
 only the credentials used by that call. The anonymous transport stays anonymous.

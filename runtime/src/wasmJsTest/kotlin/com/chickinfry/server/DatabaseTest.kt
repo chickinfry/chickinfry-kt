@@ -52,7 +52,8 @@ class DatabaseTest {
         mockMissing(true)
         val repository = Repository(DatabaseConnection(17.0), table)
         val key = mapOf("scope" to "tenant", "id" to "00000000-0000-0000-0000-000000000001")
-        assertEquals("not_found", assertFailsWith<DatabaseError> { repository.update(key, mapOf("note" to "new")) }.code)
+        val error = assertFailsWith<DatabaseError> { repository.update(key, mapOf("note" to "new")) }
+        assertTrue(error.code == "not_found")
         "passed".toJsString()
     }
 
@@ -116,7 +117,7 @@ class DatabaseTest {
         assertFailsWith<IllegalArgumentException> { optionalKey.upsert(mapOf("id" to recordKey["id"])) }
         assertEquals(before, frames().toString())
         mockMissing(true)
-        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.upsert(recordInput) }.code)
+        assertNull(assertFailsWith<DatabaseError> { repository.upsert(recordInput) }.code)
         "passed".toJsString()
     }
 
@@ -194,10 +195,14 @@ class DatabaseTest {
         assertEquals("[\"tenant\",\"00000000-0000-0000-0000-000000000001\"]", lastParameters().toString())
         mockMissing(true)
         assertNull(repository.delete(recordKey))
+        for ((fault, expected) in listOf("invalid_host_call" to null, "database_failed" to null, "28P01" to "28P01")) {
+            queryFault(fault.toJsString())
+            assertEquals(expected, assertFailsWith<DatabaseError> { repository.delete(recordKey) }.code)
+        }
         queryFault("database_failed".toJsString())
-        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.update(recordKey, mapOf("note" to "new")) }.code)
-        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.increment(recordKey, mapOf("count" to 1)) }.code)
-        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.delete(recordKey) }.code)
+        assertNull(assertFailsWith<DatabaseError> { repository.update(recordKey, mapOf("note" to "new")) }.code)
+        assertNull(assertFailsWith<DatabaseError> { repository.increment(recordKey, mapOf("count" to 1)) }.code)
+        assertNull(assertFailsWith<DatabaseError> { repository.delete(recordKey) }.code)
         "passed".toJsString()
     }
 
@@ -293,7 +298,7 @@ class DatabaseTest {
         commitFault("commit_unknown".toJsString())
         val before = frames().toString()
         val error = assertFailsWith<DatabaseError> { connection.transaction { leased = it; Repository(it, table).insert(input) } }
-        assertEquals("commit_unknown", error.code)
+        assertNull(error.code)
         assertEquals(TransactionState.COMMIT_UNKNOWN, leased.transactionState)
         val after = frames().toString().removePrefix(before.removeSuffix("]"))
         assertEquals(1, Regex("\\\"op\\\":\\\"commit\\\"").findAll(after).count())

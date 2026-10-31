@@ -7,7 +7,7 @@ Maven Central yet.
 ## Usage
 
 Generate a Kotlin client with the Chickinfry CLI and pass a runtime transport
-to its generated `Client` constructor. Use HTTPS for remote origins or an
+to its generated `createClient(transport)` function. Use HTTPS for remote origins or an
 explicit loopback IP with HTTP for local development.
 
 ```kotlin

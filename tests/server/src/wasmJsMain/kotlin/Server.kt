@@ -25,6 +25,8 @@ private class Values : AbstractMap<String, Any?>() {
     }
 }
 
+fun databaseErrorCode(error: DatabaseError): String? = error.code
+
 private val application = Application({ it == "probe.run" }) { context, input ->
     val connection = DatabaseConnection(context.requestId)
     val id = ColumnDefinition("id", ColumnKind.ID)

@@ -40,7 +40,16 @@ private external fun rowCount(value: JsonObject): Int
 @JsFun("(value, index) => { const row = value.rows[index]; if (row === null || typeof row !== 'object' || Array.isArray(row)) throw new Error('Invalid database row'); return row; }")
 private external fun databaseRow(value: JsonObject, index: Int): JsonObject
 
-class DatabaseError internal constructor(internal val code: String) : Exception("Database operation failed")
+/**
+ * A database operation failure.
+ *
+ * [code] is `not_found` for a missing row, a five-character SQLSTATE code
+ * for a database driver failure, or null for other failures.
+ */
+class DatabaseError internal constructor(internal val classification: String) : Exception("Database operation failed") {
+    val code: String? = classification.takeIf { it == "not_found" ||
+        (it.length == 5 && it.all { char -> char in 'A'..'Z' || char in '0'..'9' }) }
+}
 
 enum class TransactionState { ACTIVE, COMMITTED, ROLLED_BACK, COMMIT_UNKNOWN }
 
@@ -107,7 +116,7 @@ class DatabaseConnection private constructor(
                 if (fieldCount(committed) != 0) throw DatabaseError("commit_unknown")
                 connection.transactionState = TransactionState.COMMITTED
             } catch (error: Throwable) {
-                connection.transactionState = if (error is DatabaseError && error.code != "commit_unknown")
+                connection.transactionState = if (error is DatabaseError && error.classification != "commit_unknown")
                     TransactionState.ROLLED_BACK else TransactionState.COMMIT_UNKNOWN
                 throw error
             }

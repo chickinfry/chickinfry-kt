@@ -6,7 +6,7 @@ import com.chickinfry.conformance.*
 import kotlinx.serialization.json.*
 
 class Factory : BridgeFactory {
-    override fun create(transport: Transport): Bridge = TypedBridge(Client(transport))
+    override fun create(transport: Transport): Bridge = TypedBridge(createClient(transport))
 }
 
 private class TypedBridge(private val client: Client) : Bridge {
