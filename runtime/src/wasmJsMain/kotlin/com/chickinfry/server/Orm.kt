@@ -21,24 +21,33 @@ class TableDefinition(val name: String, val primary: List<String>, val columns: 
 }
 
 class Field<T>(internal val definition: ColumnDefinition) {
+    /** Compares a non-null value; use [isNull] for SQL NULL. */
     fun eq(value: T): Filter = comparison("=", value)
+    /** Compares a non-null value; use [isNotNull] for SQL NULL. */
     fun ne(value: T): Filter = comparison("<>", value)
     fun lt(value: T): Filter = comparison("<", value)
     fun lte(value: T): Filter = comparison("<=", value)
     fun gt(value: T): Filter = comparison(">", value)
     fun gte(value: T): Filter = comparison(">=", value)
+    /** Matches any supplied non-null value. An empty list matches no rows. */
+    fun isIn(values: List<T & Any>): Filter {
+        val copy: List<Any?> = values.toList()
+        require(copy.none { it == null }) { "Filter values cannot be null or undefined; use isNull or isNotNull." }
+        return Filter.In(definition, copy)
+    }
     fun isNull(): Filter { require(definition.nullable); return Filter.Null(definition, false) }
     fun isNotNull(): Filter { require(definition.nullable); return Filter.Null(definition, true) }
     fun asc(): Order = Order(definition, false)
     fun desc(): Order = Order(definition, true)
     private fun comparison(operator: String, value: T): Filter {
-        require(value != null) { "Use a null predicate" }
+        require(value != null) { "Filter values cannot be null or undefined; use isNull or isNotNull." }
         return Filter.Compare(definition, operator, value)
     }
 }
 
 sealed class Filter {
     internal class Compare(val column: ColumnDefinition, val operator: String, val value: Any?) : Filter()
+    internal class In(val column: ColumnDefinition, val values: List<Any?>) : Filter()
     internal class Null(val column: ColumnDefinition, val negate: Boolean) : Filter()
     internal class Group(val operator: String, val filters: List<Filter>) : Filter()
     internal class Negate(val filter: Filter) : Filter()
@@ -62,12 +71,28 @@ class Repository(private val connection: DatabaseConnection, private val table: 
     private val tableName = identifier(table.name)
     private val selection = joinStrings(table.columns.map { identifier(it.name) }, ", ")
 
-    suspend fun insert(values: Map<String, Any?>): Map<String, Any?> {
+    /** Inserts supplied values and returns the decoded row, preserving omitted defaults. */
+    suspend fun insert(values: Map<String, Any?>): Map<String, Any?> = insertRow(values, false)
+
+    /** Inserts a row or updates its supplied mutable columns on a primary-key conflict.
+     * Every primary key and at least one mutable value must be supplied.
+     */
+    suspend fun upsert(row: Map<String, Any?>): Map<String, Any?> = insertRow(row, true)
+
+    private suspend fun insertRow(values: Map<String, Any?>, upsert: Boolean): Map<String, Any?> {
         connection.ensureActive()
         require(table.columns.all { it.optional || values.containsKey(it.name) }) { "Missing required column" }
         val params = values.map { (name, value) -> validateValue(table.column(name), value) }
-        val sql = if (values.isEmpty()) "insert into $tableName default values" else
+        var sql = if (values.isEmpty()) "insert into $tableName default values" else
             "insert into $tableName (${joinStrings(values.keys.map(::identifier), ", ")}) values (${joinStrings(params.indices.map { "$${it + 1}" }, ", ")})"
+        if (upsert) {
+            require(table.primary.all { values.containsKey(it) }) { "Upsert requires every primary key value." }
+            val mutable = values.keys.filter { it !in table.primary }
+            require(mutable.isNotEmpty()) { "Upsert requires mutable values." }
+            val primary = joinStrings(table.primary.map(::identifier), ", ")
+            val assignments = joinStrings(mutable.map { "${identifier(it)} = excluded.${identifier(it)}" }, ", ")
+            sql += " on conflict ($primary) do update set $assignments"
+        }
         return one("$sql returning $selection", params)
     }
 
@@ -92,22 +117,74 @@ class Repository(private val connection: DatabaseConnection, private val table: 
         return connection.query(sql, params).map { decodeRow(it, table) }
     }
 
+    /** Updates mutable values and returns the row; throws [DatabaseError] with code `not_found` on absence. */
     suspend fun update(key: Map<String, Any?>, patch: Map<String, Any?>): Map<String, Any?> {
         connection.ensureActive()
-        require(patch.isNotEmpty() && patch.keys.none { it in table.primary }) { "Invalid update" }
         val params = mutableListOf<Any?>()
-        val assignments = joinStrings(patch.entries.map { (name, value) ->
-            params.add(validateValue(table.column(name), value))
-            "${identifier(name)} = $${params.size}"
-        }, ", ")
-        val where = keyPredicate(key, params)
-        return one("update $tableName set $assignments where $where returning $selection", params)
+        return updateRow(key, null, setAssignments(patch, params), params) ?: throw DatabaseError("not_found")
     }
 
-    suspend fun delete(key: Map<String, Any?>): Boolean {
+    /** Updates mutable values only when both the key and condition match; returns null on no match. */
+    suspend fun updateIf(key: Map<String, Any?>, condition: Filter, patch: Map<String, Any?>): Map<String, Any?>? {
+        connection.ensureActive()
+        val params = mutableListOf<Any?>()
+        return updateRow(key, condition, setAssignments(patch, params), params)
+    }
+
+    /** Adds non-zero safe integers atomically; throws [DatabaseError] with code `not_found` on absence. */
+    suspend fun increment(key: Map<String, Any?>, columns: Map<String, Any?>): Map<String, Any?> {
+        connection.ensureActive()
+        val params = mutableListOf<Any?>()
+        return updateRow(key, null, incrementAssignments(columns, params), params) ?: throw DatabaseError("not_found")
+    }
+
+    /** Increments and sets distinct mutable columns atomically when the key and condition match.
+     * Both maps must be non-empty. Deltas must be non-zero safe integers; no match returns null.
+     */
+    suspend fun incrementIf(key: Map<String, Any?>, condition: Filter, increments: Map<String, Any?>, set: Map<String, Any?>): Map<String, Any?>? {
+        connection.ensureActive()
+        require(increments.isNotEmpty() && set.isNotEmpty()) { "Increment updates require both increment and set columns." }
+        require(increments.keys.none { it in set }) { "A column cannot be incremented and set together." }
+        val params = mutableListOf<Any?>()
+        val assignments = incrementAssignments(increments, params) + setAssignments(set, params)
+        return updateRow(key, condition, assignments, params)
+    }
+
+    private fun setAssignments(patch: Map<String, Any?>, params: MutableList<Any?>): List<String> {
+        require(patch.isNotEmpty() && patch.keys.none { it in table.primary }) { "Invalid update" }
+        return patch.entries.map { (name, value) ->
+            params.add(validateValue(table.column(name), value))
+            "${identifier(name)} = $${params.size}"
+        }
+    }
+
+    private fun incrementAssignments(columns: Map<String, Any?>, params: MutableList<Any?>): List<String> {
+        require(columns.isNotEmpty()) { "No columns to increment." }
+        return columns.entries.map { (name, value) ->
+            table.column(name)
+            require(name !in table.primary) { "Invalid increment" }
+            require(value is Number) { "Increment amounts must be non-zero safe integers." }
+            val amount = value.toDouble()
+            require(amount != 0.0 && amount % 1.0 == 0.0 && amount in -9007199254740991.0..9007199254740991.0) {
+                "Increment amounts must be non-zero safe integers."
+            }
+            params.add(value.toLong())
+            "${identifier(name)} = ${identifier(name)} + $${params.size}"
+        }
+    }
+
+    private suspend fun updateRow(key: Map<String, Any?>, condition: Filter?, assignments: List<String>, params: MutableList<Any?>): Map<String, Any?>? {
+        val where = keyPredicate(key, params)
+        val matching = if (condition == null) where else "($where and ${predicate(condition, params)})"
+        return connection.query("update $tableName set ${joinStrings(assignments, ", ")} where $matching returning $selection", params)
+            .singleOrNull()?.let { decodeRow(it, table) }
+    }
+
+    /** Deletes and returns the decoded row, or null when the key does not exist. */
+    suspend fun delete(key: Map<String, Any?>): Map<String, Any?>? {
         val params = mutableListOf<Any?>()
         val where = keyPredicate(key, params)
-        return connection.query("delete from $tableName where $where returning $selection", params).isNotEmpty()
+        return connection.query("delete from $tableName where $where returning $selection", params).singleOrNull()?.let { decodeRow(it, table) }
     }
 
     private suspend fun one(sql: String, params: List<Any?>): Map<String, Any?> =
@@ -124,8 +201,20 @@ class Repository(private val connection: DatabaseConnection, private val table: 
     private fun predicate(filter: Filter, params: MutableList<Any?>): String = when (filter) {
         is Filter.Compare -> {
             require(table.column(filter.column.name) == filter.column)
+            require(filter.value != null) { "Filter values cannot be null or undefined; use isNull or isNotNull." }
             params.add(validateValue(filter.column, filter.value))
             "${identifier(filter.column.name)} ${filter.operator} $${params.size}"
+        }
+        is Filter.In -> {
+            require(table.column(filter.column.name) == filter.column)
+            require(filter.values.none { it == null }) { "Filter values cannot be null or undefined; use isNull or isNotNull." }
+            if (filter.values.isEmpty()) "1 = 0" else {
+                val placeholders = filter.values.map {
+                    params.add(validateValue(filter.column, it))
+                    "$${params.size}"
+                }
+                "${identifier(filter.column.name)} in (${joinStrings(placeholders, ", ")})"
+            }
         }
         is Filter.Null -> {
             require(table.column(filter.column.name) == filter.column && filter.column.nullable)

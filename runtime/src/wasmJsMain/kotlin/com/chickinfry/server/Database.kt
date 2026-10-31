@@ -120,6 +120,10 @@ internal fun jsonValue(value: Any?): String = when (value) {
     null -> "null"
     is String -> quoteJson(value.toJsString()).toString()
     is Int -> value.toString()
+    is Long -> {
+        require(value in -9007199254740991L..9007199254740991L)
+        value.toString()
+    }
     else -> error("Unsupported database value")
 }
 

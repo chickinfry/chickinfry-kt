@@ -10,8 +10,20 @@ import kotlin.js.Promise
 import kotlin.js.toJsString
 import kotlin.test.*
 
-@JsFun("() => { globalThis.dbFrames = []; globalThis.dbFault = ''; globalThis.dbRow = {id:'00000000-0000-0000-0000-000000000001', scope:'tenant', stamp:'2026-10-14 00:00:00.000001+00', day:'2024-02-29', count:7, note:null}; globalThis.__chik = {db: async bytes => { const frame = JSON.parse(new TextDecoder().decode(bytes)); globalThis.dbFrames.push(frame); let response = frame.op === 'begin' ? {lease:1} : frame.op === 'commit' || frame.op === 'rollback' ? {} : {rows:[globalThis.dbRow]}; if (frame.op === 'commit' && globalThis.dbFault) response = {error:globalThis.dbFault}; return new TextEncoder().encode(JSON.stringify(response)); }}; }")
+@JsFun("() => { globalThis.dbFrames = []; globalThis.dbFault = ''; globalThis.dbMissing = false; globalThis.dbQueryFault = ''; globalThis.dbRow = {id:'00000000-0000-0000-0000-000000000001', scope:'tenant', stamp:'2026-10-14 00:00:00.000001+00', day:'2024-02-29', count:7, note:null}; globalThis.__chik = {db: async bytes => { const frame = JSON.parse(new TextDecoder().decode(bytes)); globalThis.dbFrames.push(frame); let response = frame.op === 'begin' ? {lease:1} : frame.op === 'commit' || frame.op === 'rollback' ? {} : {rows:globalThis.dbMissing ? [] : [globalThis.dbRow]}; if (frame.op === 'commit' && globalThis.dbFault) response = {error:globalThis.dbFault}; if ((frame.op === 'query' || frame.op === 'exec') && globalThis.dbQueryFault) response = {error:globalThis.dbQueryFault}; return new TextEncoder().encode(JSON.stringify(response)); }}; }")
 private external fun installDatabaseMock()
+
+@JsFun("(missing) => { globalThis.dbMissing = missing; }")
+private external fun mockMissing(missing: Boolean)
+
+@JsFun("(fault) => { globalThis.dbQueryFault = fault; }")
+private external fun queryFault(fault: JsString)
+
+@JsFun("() => globalThis.dbFrames[globalThis.dbFrames.length - 1].sql")
+private external fun lastSql(): JsString
+
+@JsFun("() => JSON.stringify(globalThis.dbFrames[globalThis.dbFrames.length - 1].params)")
+private external fun lastParameters(): JsString
 
 @JsFun("(fault) => { globalThis.dbFault = fault; }")
 private external fun commitFault(fault: JsString)
@@ -28,7 +40,167 @@ private val table = TableDefinition("records", listOf("scope", "id"), listOf(
     ColumnDefinition("count", ColumnKind.INTEGER, optional = true), ColumnDefinition("note", ColumnKind.STRING, nullable = true, optional = true),
 ))
 
+private val recordKey = mapOf("scope" to "tenant", "id" to "00000000-0000-0000-0000-000000000001")
+private val recordInput = recordKey + mapOf("stamp" to "2026-10-14T09:00:00.000001+09:00", "day" to "2024-02-29", "note" to null)
+private val recordRow = mapOf("id" to recordKey["id"], "scope" to "tenant", "stamp" to "2026-10-14T00:00:00.000001Z", "day" to "2024-02-29", "count" to 7, "note" to null)
+private const val selectedColumns = "\"id\", \"scope\", \"stamp\", \"day\", \"count\", \"note\""
+
 class DatabaseTest {
+    @Test
+    fun missingUpdateReportsNotFound(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        mockMissing(true)
+        val repository = Repository(DatabaseConnection(17.0), table)
+        val key = mapOf("scope" to "tenant", "id" to "00000000-0000-0000-0000-000000000001")
+        assertEquals("not_found", assertFailsWith<DatabaseError> { repository.update(key, mapOf("note" to "new")) }.code)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun membershipFiltersBindValuesAndSnapshotLists(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        val count = Field<Int>(table.column("count"))
+        val note = Field<String?>(table.column("note"))
+        val values = mutableListOf("O'Reilly", "x'); drop table records; --")
+        val filter = note.isIn(values)
+        values.clear()
+        assertEquals(listOf(recordRow), repository.findMany(FindMany(where = count.gt(0) and filter)))
+        assertEquals("select $selectedColumns from \"records\" where (\"count\" > $1 and \"note\" in ($2, $3))", lastSql().toString())
+        assertEquals("[0,\"O'Reilly\",\"x'); drop table records; --\"]", lastParameters().toString())
+        repository.findMany(FindMany(where = count.isIn(listOf(Int.MIN_VALUE, Int.MAX_VALUE))))
+        assertEquals("select $selectedColumns from \"records\" where \"count\" in ($1, $2)", lastSql().toString())
+        assertEquals("[-2147483648,2147483647]", lastParameters().toString())
+        repository.findMany(FindMany(where = count.isIn(emptyList())))
+        assertEquals("select $selectedColumns from \"records\" where 1 = 0", lastSql().toString())
+        assertEquals("[]", lastParameters().toString())
+        repository.findMany(FindMany(where = note.isIn(listOf("x")) or note.isNull()))
+        assertEquals("select $selectedColumns from \"records\" where (\"note\" in ($1) or \"note\" is null)", lastSql().toString())
+        assertEquals("[\"x\"]", lastParameters().toString())
+        "passed".toJsString()
+    }
+
+    @Test
+    @Suppress("UNCHECKED_CAST")
+    fun invalidFilterValuesNeverReachTheDatabase(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        val note = Field<String?>(table.column("note"))
+        val message = "Filter values cannot be null or undefined; use isNull or isNotNull."
+        assertEquals(message, assertFailsWith<IllegalArgumentException> { note.eq(null) }.message)
+        assertEquals(message, assertFailsWith<IllegalArgumentException> { note.ne(null) }.message)
+        assertEquals(message, assertFailsWith<IllegalArgumentException> { note.isIn(listOf("x", null) as List<String>) }.message)
+        for (filter in listOf(Filter.Compare(table.column("note"), "=", null), Filter.In(table.column("note"), listOf(null)))) {
+            assertEquals(message, assertFailsWith<IllegalArgumentException> { repository.findMany(FindMany(where = filter)) }.message)
+        }
+        assertFailsWith<IllegalArgumentException> { repository.findMany(FindMany(where = note.isIn(listOf("bad\u0000value")))) }
+        assertFailsWith<IllegalStateException> { repository.findMany(FindMany(where = Field<String>(ColumnDefinition("missing", ColumnKind.STRING)).isIn(emptyList()))) }
+        assertEquals("[]", frames().toString())
+        "passed".toJsString()
+    }
+
+    @Test
+    fun upsertUsesCompositeKeysAndOnlyProvidedMutableValues(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        assertEquals(recordRow, repository.upsert(recordInput))
+        assertEquals("insert into \"records\" (\"scope\", \"id\", \"stamp\", \"day\", \"note\") values ($1, $2, $3, $4, $5) on conflict (\"scope\", \"id\") do update set \"stamp\" = excluded.\"stamp\", \"day\" = excluded.\"day\", \"note\" = excluded.\"note\" returning $selectedColumns", lastSql().toString())
+        assertEquals("[\"tenant\",\"00000000-0000-0000-0000-000000000001\",\"2026-10-14T00:00:00.000001Z\",\"2024-02-29\",null]", lastParameters().toString())
+        val before = frames().toString()
+        assertFailsWith<IllegalArgumentException> { repository.upsert(recordInput - "scope") }
+        assertFailsWith<IllegalStateException> { repository.upsert(recordInput + ("unknown" to 1)) }
+        val optionalKey = Repository(DatabaseConnection(17.0), TableDefinition("keys", listOf("id"), listOf(
+            ColumnDefinition("id", ColumnKind.ID, optional = true), ColumnDefinition("note", ColumnKind.STRING, optional = true),
+        )))
+        assertFailsWith<IllegalArgumentException> { optionalKey.upsert(mapOf("note" to "x")) }
+        assertFailsWith<IllegalArgumentException> { optionalKey.upsert(mapOf("id" to recordKey["id"])) }
+        assertEquals(before, frames().toString())
+        mockMissing(true)
+        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.upsert(recordInput) }.code)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun conditionalWritesBindTheKeyAndConditionAtomically(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        val count = Field<Int>(table.column("count"))
+        assertEquals(recordRow, repository.updateIf(recordKey, count.eq(6) or count.eq(7), mapOf("note" to null)))
+        assertEquals("update \"records\" set \"note\" = $1 where (\"scope\" = $2 and \"id\" = $3 and (\"count\" = $4 or \"count\" = $5)) returning $selectedColumns", lastSql().toString())
+        assertEquals("[null,\"tenant\",\"00000000-0000-0000-0000-000000000001\",6,7]", lastParameters().toString())
+        assertEquals(recordRow, repository.incrementIf(recordKey, count.gte(2), mapOf("count" to -2), mapOf("note" to "new")))
+        assertEquals("update \"records\" set \"count\" = \"count\" + $1, \"note\" = $2 where (\"scope\" = $3 and \"id\" = $4 and \"count\" >= $5) returning $selectedColumns", lastSql().toString())
+        assertEquals("[-2,\"new\",\"tenant\",\"00000000-0000-0000-0000-000000000001\",2]", lastParameters().toString())
+        mockMissing(true)
+        assertNull(repository.updateIf(recordKey, count.eq(8), mapOf("note" to "new")))
+        assertNull(repository.incrementIf(recordKey, count.eq(8), mapOf("count" to 1), mapOf("note" to null)))
+        "passed".toJsString()
+    }
+
+    @Test
+    fun incrementsAcceptSafeIntegerDeltasAndReportMissingTargets(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        for ((amount, encoded) in listOf(
+            1 to "1", -1 to "-1", Int.MIN_VALUE to "-2147483648", Int.MAX_VALUE to "2147483647",
+            9007199254740991L to "9007199254740991", -9007199254740991L to "-9007199254740991", 2.0 to "2",
+        )) {
+            assertEquals(recordRow, repository.increment(recordKey, mapOf("count" to amount)))
+            assertEquals("update \"records\" set \"count\" = \"count\" + $1 where \"scope\" = $2 and \"id\" = $3 returning $selectedColumns", lastSql().toString())
+            assertEquals("[$encoded,\"tenant\",\"00000000-0000-0000-0000-000000000001\"]", lastParameters().toString())
+        }
+        mockMissing(true)
+        assertEquals("not_found", assertFailsWith<DatabaseError> { repository.increment(recordKey, mapOf("count" to 1)) }.code)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun invalidWritesFailBeforeTheHostCall(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        val count = Field<Int>(table.column("count"))
+        for (amount in listOf(null, 0, 0L, -0.0, 1.5, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY,
+            9007199254740992L, -9007199254740992L, Long.MAX_VALUE, Long.MIN_VALUE, "1", true)) {
+            assertFailsWith<IllegalArgumentException> { repository.increment(recordKey, mapOf("count" to amount)) }
+            assertFailsWith<IllegalArgumentException> { repository.incrementIf(recordKey, count.eq(7), mapOf("count" to amount), mapOf("note" to null)) }
+        }
+        for (columns in listOf(emptyMap(), mapOf("id" to 1))) {
+            assertFailsWith<IllegalArgumentException> { repository.increment(recordKey, columns) }
+            assertFailsWith<IllegalArgumentException> { repository.incrementIf(recordKey, count.eq(7), columns, mapOf("note" to null)) }
+        }
+        for (patch in listOf(emptyMap(), mapOf("id" to recordKey["id"]), mapOf("count" to 2147483648L), mapOf("count" to -2147483649L), mapOf("count" to null))) {
+            assertFailsWith<IllegalArgumentException> { repository.updateIf(recordKey, count.eq(7), patch) }
+            assertFailsWith<IllegalArgumentException> { repository.incrementIf(recordKey, count.eq(7), mapOf("count" to 1), patch) }
+        }
+        assertFailsWith<IllegalStateException> { repository.increment(recordKey, mapOf("unknown" to 1)) }
+        assertFailsWith<IllegalStateException> { repository.incrementIf(recordKey, count.eq(7), mapOf("unknown" to 1), mapOf("note" to null)) }
+        assertFailsWith<IllegalStateException> { repository.updateIf(recordKey, count.eq(7), mapOf("unknown" to 1)) }
+        assertFailsWith<IllegalStateException> { repository.incrementIf(recordKey, count.eq(7), mapOf("count" to 1), mapOf("unknown" to 1)) }
+        assertEquals("A column cannot be incremented and set together.", assertFailsWith<IllegalArgumentException> {
+            repository.incrementIf(recordKey, count.eq(7), mapOf("count" to 1), mapOf("count" to 8))
+        }.message)
+        assertFailsWith<IllegalArgumentException> { repository.increment(mapOf("id" to recordKey["id"]), mapOf("count" to 1)) }
+        assertFailsWith<IllegalArgumentException> { jsonValue(9007199254740992L) }
+        assertEquals("[]", frames().toString())
+        "passed".toJsString()
+    }
+
+    @Test
+    fun deleteReturnsTheDecodedRowOrNullAndHostErrorsPropagate(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        installDatabaseMock()
+        val repository = Repository(DatabaseConnection(17.0), table)
+        assertEquals(recordRow, repository.delete(recordKey))
+        assertEquals("delete from \"records\" where \"scope\" = $1 and \"id\" = $2 returning $selectedColumns", lastSql().toString())
+        assertEquals("[\"tenant\",\"00000000-0000-0000-0000-000000000001\"]", lastParameters().toString())
+        mockMissing(true)
+        assertNull(repository.delete(recordKey))
+        queryFault("database_failed".toJsString())
+        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.update(recordKey, mapOf("note" to "new")) }.code)
+        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.increment(recordKey, mapOf("count" to 1)) }.code)
+        assertEquals("database_failed", assertFailsWith<DatabaseError> { repository.delete(recordKey) }.code)
+        "passed".toJsString()
+    }
+
     @Test
     fun timestampPrecisionAndCalendar() {
         for ((input, output) in mapOf(
@@ -113,6 +285,10 @@ class DatabaseTest {
         assertFails { alias.insert(input) }
         assertFails { alias.findMany() }
         assertFails { alias.update(key, mapOf("note" to null)) }
+        assertFails { alias.upsert(input) }
+        assertFails { alias.updateIf(key, count.eq(7), mapOf("note" to null)) }
+        assertFails { alias.increment(key, mapOf("count" to 1)) }
+        assertFails { alias.incrementIf(key, count.eq(7), mapOf("count" to 1), mapOf("note" to null)) }
         assertFails { alias.delete(key) }
         commitFault("commit_unknown".toJsString())
         val before = frames().toString()
