@@ -143,7 +143,9 @@ internal class CallObservation(
 
     @Synchronized
     fun exposesRawDetails(failure: Throwable): Boolean {
+        // SDK messages contain only public code/status; their causes still need inspection.
         val visible = generateSequence(failure) { it.cause }.take(16)
+            .filter { it !is OperationError && it !is ClientError }
             .flatMap { sequenceOf(it.message.orEmpty(), it.toString()) }.toList()
         return visible.any { text -> rawDetails.any { it in text } }
     }

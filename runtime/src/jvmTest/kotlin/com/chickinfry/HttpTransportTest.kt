@@ -70,6 +70,10 @@ class HttpTransportTest {
                 override fun toString(): String = "Safe display."
             }))
             assertTrue(observation.exposesRawDetails(IllegalStateException("Safe failure.", IllegalArgumentException("raw-body-secret"))))
+            for (failure in listOf(OperationError("internal", 503), ClientError("internal", 503))) {
+                failure.initCause(IllegalArgumentException("raw-body-secret"))
+                assertTrue(observation.exposesRawDetails(failure))
+            }
             transport.close()
         }
     }
@@ -380,17 +384,20 @@ class HttpTransportTest {
     fun retryAfterZeroNeverReplaysOneShotPost() = runBlocking {
         for (chunked in listOf(false, true)) {
             val events = mutableListOf<CallEvent>()
+            val observation = CallObservation("retry", events::add)
             Peer {
                 it.responseHeaders.add("Retry-After", "0")
                 it.reply("{\"error\":\"service_busy\"}", 503, chunked)
             }.use { peer ->
                 val transport = HttpTransport(peer.origin)
                 val failure = assertFailsWith<OperationError> {
-                    withContext(CallObservation("retry", events::add)) { transport.invoke("probe.echo", emptyInput) { it } }
+                    withContext(observation) { transport.invoke("probe.echo", emptyInput) { it } }
                 }
                 assertEquals("service_busy", failure.code)
                 assertEquals(503, failure.status)
                 assertEquals(1, peer.requests.get())
+                assertFalse(observation.exposesRawDetails(failure))
+                assertFalse(observation.exposesRawDetails(ClientError("internal", 503)))
                 assertTrue(events.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
                 assertFalse(events.any { it.phase.startsWith("cancel") })
                 transport.close()
