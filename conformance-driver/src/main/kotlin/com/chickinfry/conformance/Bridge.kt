@@ -1,6 +1,6 @@
 package com.chickinfry.conformance
 
-import com.chickinfry.ClientTransport
+import com.chickinfry.Transport
 import java.io.Closeable
 import java.net.URLClassLoader
 import java.nio.file.Path
@@ -8,7 +8,7 @@ import java.util.ServiceLoader
 import kotlinx.serialization.json.*
 
 interface BridgeFactory {
-    fun create(transport: ClientTransport): Bridge
+    fun create(transport: Transport): Bridge
 }
 
 interface Bridge {
@@ -33,7 +33,7 @@ internal class Fixtures(paths: Map<String, List<Path>>) : Closeable {
         }
         providers.single()
     }
-    fun create(fixture: String, transport: ClientTransport): Bridge =
+    fun create(fixture: String, transport: Transport): Bridge =
         (factories[fixture] ?: invalidArgs()).create(transport)
     override fun close() { loaders.values.forEach { it.close() } }
 }

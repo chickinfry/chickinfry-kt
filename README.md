@@ -12,15 +12,17 @@ explicit loopback IP with HTTP for local development.
 
 ```kotlin
 import com.chickinfry.HttpTransport
-import com.chickinfry.MemorySessionStore
+import com.chickinfry.MemoryStore
 
 val origin = "https://api.example.com"
 val transport = HttpTransport(origin)
-val store = MemorySessionStore(origin)
+// After signing in with the anonymous transport, save the returned credentials.
+val store = MemoryStore(origin, credentials)
 val signedIn = transport.withSession(store)
 ```
 
-Share the same store object between clients that share a session. The memory
+Call the suspending `withSession` function from a coroutine. It rejects a store
+without credentials before sending a request. Share the same store object between clients that share a session. The memory
 store does not persist credentials across process restarts. See the
 [runtime guide](runtime/README.md) for session behavior, custom stores, and
 Kotlin/Wasm server restrictions.

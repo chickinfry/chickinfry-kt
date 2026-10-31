@@ -11,7 +11,7 @@ data class SessionCredentials(
 ) {
     init {
         if (!credentialPattern.matches(accessToken) || !credentialPattern.matches(refreshToken)) {
-            throw ClientException("invalid_token")
+            throw ClientError("invalid_argument")
         }
     }
 
@@ -28,7 +28,7 @@ interface SessionStore {
 }
 
 /** In-memory store; neither records nor unknown refresh outcomes survive a process restart. */
-class MemorySessionStore(origin: String, initial: SessionCredentials? = null) : SessionStore {
+class MemoryStore(origin: String, initial: SessionCredentials? = null) : SessionStore {
     override val origin: String = validateOrigin(origin).toString().removeSuffix("/")
     private val lock = Any()
     private var credentials = initial
@@ -47,7 +47,7 @@ class MemorySessionStore(origin: String, initial: SessionCredentials? = null) : 
 
     internal fun snapshot(): SessionSnapshot = synchronized(lock) { SessionSnapshot(credentials, revision) }
 
-    override fun toString(): String = "MemorySessionStore"
+    override fun toString(): String = "MemoryStore"
 }
 
 internal data class SessionSnapshot(val credentials: SessionCredentials?, val revision: Long)

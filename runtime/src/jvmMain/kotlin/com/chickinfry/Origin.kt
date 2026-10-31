@@ -5,7 +5,7 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 internal fun validateOrigin(origin: String): HttpUrl {
-    fun invalid(): Nothing = throw ClientException("invalid_origin")
+    fun invalid(): Nothing = throw ClientError("invalid_argument")
     if (origin.any { it <= ' ' || it == '\u007f' || it == '\\' || it.isWhitespace() || Character.isSpaceChar(it) }) invalid()
     val uri = try {
         URI(origin)

@@ -25,7 +25,7 @@ internal class WireResponse(val json: JsonObject, val status: Int) {
     fun <T> decode(decode: (JsonObject) -> T): T = try {
         decode(json)
     } catch (_: SerializationException) {
-        throw ClientException("invalid_response", status, true)
+        throw ClientError("internal", status, true)
     }
 
     fun credentials(): SessionCredentials = decode { json ->
@@ -88,12 +88,12 @@ internal suspend fun invokeSession(
         val response = selectedSend(expected?.accessToken)
         val replacement = response.credentials()
         if (!replace(store, expected, replacement, response.status)) {
-            throw ClientException("invalid_token", response.status, outcomeUnknown = true)
+            throw ClientError("unauthenticated")
         }
         return response
     }
     if (expected != null && state.mutex.withLock { expected.refreshToken in state.suspended }) {
-        throw ClientException("invalid_token", outcomeUnknown = true)
+        throw ClientError("unauthenticated")
     }
     if (operation == "auth.refresh") {
         // Explicit refresh shares the single-consumption path with automatic refresh of the same credentials.
@@ -101,7 +101,7 @@ internal suspend fun invokeSession(
         val input = Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)) as JsonObject
         val token = input["refresh_token"] as? JsonPrimitive
         if (token == null || !token.isString || !credentialPattern.matches(token.content)) {
-            throw ClientException("invalid_token")
+            throw ClientError("invalid_argument")
         }
         return refresh(store, state, expected, token.content, bytes, timeoutMillis, observation, callObservation, send, selectSuccess = true)
     }
@@ -110,7 +110,7 @@ internal suspend fun invokeSession(
     val response = try {
         send(operation, bytes, expected?.accessToken) { exchange = it }.also { callObservation?.select(exchange) }
     } catch (failure: OperationError) {
-        if (expected == null || failure.code != "invalid_token" || failure.httpStatus != 401) {
+        if (expected == null || failure.code != "invalid_token" || failure.status != 401) {
             callObservation?.select(exchange)
             throw failure
         }
@@ -141,11 +141,11 @@ private suspend fun refresh(
     selectSuccess: Boolean = false,
 ): WireResponse {
     val (flight, participated, leader) = state.mutex.withLock {
-        if (refreshToken in state.suspended) throw ClientException("invalid_token", outcomeUnknown = true)
+        if (refreshToken in state.suspended) throw ClientError("unauthenticated")
         val existing = state.flights[refreshToken]
         if (existing != null) Triple(existing, !existing.result.isCompleted, false) else {
-            if (expected != null && expected.refreshToken != refreshToken) throw ClientException("invalid_token")
-            if (read(store) != expected) throw ClientException("invalid_token")
+            if (expected != null && expected.refreshToken != refreshToken) throw ClientError("unauthenticated")
+            if (read(store) != expected) throw ClientError("unauthenticated")
             // Retire completed flights so past credentials do not accumulate on every rotation.
             state.flights.entries.removeAll { it.value.result.isCompleted }
             val created = RefreshFlight().also { created ->
@@ -153,17 +153,17 @@ private suspend fun refresh(
                 val scope = CoroutineScope(Dispatchers.IO)
                 created.worker = scope.launch(start = CoroutineStart.LAZY) {
                     val startedAt = System.nanoTime()
-                    var httpStatus: Int? = null
+                    var status: Int? = null
                     var exchange: CallObservation.Exchange? = null
                     try {
                         // Deadline and status observation of the send itself stay in the existing transport layer.
                         val result = if (observation == null) send("auth.refresh", bytes, expected?.accessToken) { exchange = it }
                         else withContext(RefreshTransmission(created.sent)) { send("auth.refresh", bytes, expected?.accessToken) { exchange = it } }
-                        httpStatus = result.status
+                        status = result.status
                         val response = withTimeout(timeoutMillis - (System.nanoTime() - startedAt) / 1_000_000) {
                             val replacement = result.credentials()
                             if (!replace(store, expected, replacement, result.status)) {
-                                throw ClientException("invalid_token", result.status, outcomeUnknown = true)
+                                throw ClientError("unauthenticated")
                             }
                             result
                         }
@@ -171,26 +171,33 @@ private suspend fun refresh(
                         created.result.complete(response)
                     } catch (failure: Throwable) {
                         withContext(NonCancellable) {
-                            val finalFailure = if (failure is OperationError && failure.httpStatus == 401) {
+                            val finalFailure = if (failure is OperationError && failure.status == 401) {
                                 try {
-                                    withTimeout(timeoutMillis - (System.nanoTime() - startedAt) / 1_000_000) {
-                                        clear(store, expected, observation, failure.httpStatus)
+                                    withTimeout(timeoutMillis) {
+                                        clear(store, expected, observation, failure.status)
                                     }
                                     failure
-                                } catch (storageFailure: Throwable) {
+                                } catch (_: Throwable) {
                                     state.mutex.withLock { state.suspended += refreshToken }
-                                    if (storageFailure is CancellationException) {
-                                        ClientException("request_timeout", failure.httpStatus, outcomeUnknown = true)
-                                    } else storageFailure
+                                    ClientError("failed_precondition", failure.status)
                                 }
                             } else {
                                 state.mutex.withLock { state.suspended += refreshToken }
-                                when (failure) {
-                                    is OperationError -> OperationError(failure.code, failure.httpStatus, true)
-                                    is ClientException -> ClientException(failure.code, failure.httpStatus, true)
-                                    is CancellationException -> ClientException("request_timeout", httpStatus, outcomeUnknown = true)
-                                    else -> failure
+                                val error = when (failure) {
+                                    is ClientError -> failure
+                                    is CancellationException -> ClientError("deadline_exceeded", status, outcomeUnknown = true)
+                                    else -> ClientError("unauthenticated", (failure as? OperationError)?.status, true)
                                 }
+                                try {
+                                    if (refreshToken == expected?.refreshToken) {
+                                        withTimeout(timeoutMillis) {
+                                            clear(store, expected, observation, error.status)
+                                        }
+                                    }
+                                } catch (_: Throwable) {
+                                    // The original refresh failure takes precedence over cleanup failures.
+                                }
+                                error
                             }
                             created.metadata = exchange?.metadata()
                             created.result.completeExceptionally(finalFailure)
@@ -216,7 +223,7 @@ private suspend fun refresh(
         if (participated) observation?.point?.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
         val response = flight.result.await()
         if (selectSuccess) callObservation?.selectResult(flight.metadata)
-        if (read(store, response.status) != response.credentials()) throw ClientException("invalid_token", response.status)
+        if (read(store, response.status) != response.credentials()) throw ClientError("unauthenticated")
         return response
     } catch (failure: CancellationException) {
         callObservation?.incomplete()
@@ -228,29 +235,31 @@ private suspend fun refresh(
     }
 }
 
-private suspend fun read(store: SessionStore, httpStatus: Int? = null): SessionCredentials? = try {
+private suspend fun read(store: SessionStore, status: Int? = null): SessionCredentials? = try {
     store.read()
 } catch (failure: CancellationException) {
     throw failure
+} catch (failure: ClientError) {
+    throw failure
 } catch (_: Throwable) {
-    throw ClientException("session_storage_error", httpStatus)
+    throw ClientError("failed_precondition", status)
 }
 
 private suspend fun replace(
     store: SessionStore,
     expected: SessionCredentials?,
     replacement: SessionCredentials?,
-    httpStatus: Int,
+    status: Int?,
 ): Boolean = try {
     store.compareAndSet(expected, replacement)
 } catch (failure: CancellationException) {
     throw failure
 } catch (_: Throwable) {
-    throw ClientException("session_storage_error", httpStatus, outcomeUnknown = true)
+    throw ClientError("failed_precondition", status, outcomeUnknown = true)
 }
 
-private suspend fun clear(store: SessionStore, expected: SessionCredentials?, observation: SessionObservation?, httpStatus: Int) {
+private suspend fun clear(store: SessionStore, expected: SessionCredentials?, observation: SessionObservation?, status: Int?) {
     observation?.clear?.invoke(ClearAttempt(observation.callId, expected, null))
-    val removed = replace(store, expected, null, httpStatus)
+    val removed = replace(store, expected, null, status)
     observation?.clear?.invoke(ClearAttempt(observation.callId, expected, removed))
 }

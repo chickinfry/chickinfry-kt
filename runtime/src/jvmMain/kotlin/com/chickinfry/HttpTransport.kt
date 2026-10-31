@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPInputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -84,17 +85,35 @@ class HttpTransport private constructor(
     private val sessionStore: SessionStore?,
     private val beforeResponse: (() -> Unit)? = null,
     private val bodyRead: ((Buffer, Buffer, Int) -> Unit)? = null,
-) : ClientTransport {
-    constructor(origin: String, requestTimeoutMillis: Long = 30_000) :
-        this(validateOrigin(origin), httpClient(requestTimeoutMillis), null, null, null)
+) : Transport {
+    /**
+     * Uses one timeout in milliseconds for the whole request; accepts 1 through 2,147,483,647.
+     * A failed session refresh gets a separate cleanup period of the same duration so conditional
+     * clearing still runs after a request timeout. Refresh may therefore take about twice this
+     * limit; cleanup does not retry the network request.
+     */
+    constructor(origin: String, timeout: Long = 30_000) :
+        this(validateOrigin(origin), httpClient(timeout), null, null, null)
 
     fun withBearer(token: String): HttpTransport {
-        if (!credentialPattern.matches(token)) throw ClientException("invalid_token")
+        if (!credentialPattern.matches(token)) throw ClientError("invalid_argument")
         return HttpTransport(origin, client, token, observer, null, beforeResponse, bodyRead)
     }
 
-    fun withSession(store: SessionStore): HttpTransport {
-        if (validateOrigin(store.origin) != origin) throw ClientException("invalid_origin")
+    /** Reads and validates an existing session before attaching its store. */
+    suspend fun withSession(store: SessionStore): HttpTransport {
+        if (validateOrigin(store.origin) != origin) throw ClientError("failed_precondition")
+        val credentials = try {
+            store.read()
+        } catch (failure: CancellationException) {
+            throw failure
+        } catch (failure: ClientError) {
+            throw failure
+        } catch (_: Throwable) {
+            throw ClientError("failed_precondition")
+        }
+        if (credentials == null || !credentialPattern.matches(credentials.accessToken) ||
+            !credentialPattern.matches(credentials.refreshToken)) throw ClientError("unauthenticated")
         return HttpTransport(origin, client, null, observer, store, beforeResponse, bodyRead)
     }
 
@@ -120,13 +139,13 @@ class HttpTransport private constructor(
         callObservation?.entered()
         try {
             sessionObservation?.point?.invoke(SessionPoint("sdk-entered", operation))
-            if (!operationPattern.matches(operation)) throw ClientException("invalid_operation")
+            if (!operationPattern.matches(operation)) throw ClientError("invalid_argument")
             val bytes = try {
                 input.toString().toByteArray(Charsets.UTF_8)
             } catch (_: SerializationException) {
-                throw ClientException("invalid_request")
+                throw ClientError("invalid_argument")
             }
-            if (bytes.size > MAX_REQUEST_BYTES) throw ClientException("request_too_large")
+            if (bytes.size > MAX_REQUEST_BYTES) throw ClientError("resource_exhausted")
             var output: Result<T>? = null
             fun validate(name: String, response: WireResponse) {
                 if (sessionStore != null && name in listOf("auth.signup", "auth.signin", "auth.refresh")) response.credentials()
@@ -231,9 +250,10 @@ class HttpTransport private constructor(
                             e.message?.let { callObservation?.raw(it) }
                             try {
                                 if (continuation.isActive) {
+                                    val code = if (e is InterruptedIOException) "deadline_exceeded" else if (call.isCanceled()) "canceled" else "unavailable"
                                     cancel()
                                     continuation.resumeWithException(
-                                        ClientException(if (e is InterruptedIOException) "request_timeout" else "transport_error",
+                                        ClientError(code,
                                             status.get().takeIf { it != 0 }, outcomeUnknown.get() != false))
                                 }
                             } finally {
@@ -254,14 +274,15 @@ class HttpTransport private constructor(
                                     outcome(false)
                                     continuation.resume(result)
                                 } catch (e: IOException) {
+                                    val code = if (e is InterruptedIOException) "deadline_exceeded" else if (call.isCanceled()) "canceled" else "unavailable"
                                     cancel()
                                     if (continuation.isActive) continuation.resumeWithException(
-                                        ClientException(if (e is InterruptedIOException) "request_timeout" else "transport_error",
+                                        ClientError(code,
                                             response.code, outcomeUnknown = true))
                                 } catch (e: Exception) {
                                     when (e) {
-                                        is ClientException -> outcome(e.outcomeUnknown)
-                                        is OperationError -> outcome(e.outcomeUnknown)
+                                        is ClientError -> outcome(e.outcomeUnknown)
+                                        is OperationError -> outcome(false)
                                     }
                                     if (continuation.isActive) continuation.resumeWithException(e)
                                 } finally {
@@ -279,7 +300,7 @@ class HttpTransport private constructor(
             result
         } catch (_: TimeoutCancellationException) {
             currentCoroutineContext().ensureActive()
-            throw ClientException("request_timeout", status.get().takeIf { it != 0 }, outcomeUnknown.get() != false)
+            throw ClientError("deadline_exceeded", status.get().takeIf { it != 0 }, outcomeUnknown.get() != false)
         } finally {
             // Wait for completion only if the response reader was already handed off; a late response is never handed off.
             if (!readerClaimed.compareAndSet(false, true)) {
@@ -299,7 +320,7 @@ class HttpTransport private constructor(
         response.headers.forEach { (_, value) -> callObservation?.raw(value) }
         if (status in 300..399) {
             cancel()
-            throw ClientException("redirect_not_allowed", status)
+            throw ClientError("internal", status, true)
         }
         val source = response.body.source()
         val buffer = Buffer()
@@ -315,7 +336,7 @@ class HttpTransport private constructor(
                 observation?.read(received.toLong(), buffer.size, source.buffer, overflow)
                 if (overflow) {
                     cancel()
-                    throw ClientException("response_too_large", status, outcomeUnknown = true)
+                    throw ClientError("resource_exhausted", status, outcomeUnknown = true)
                 }
                 buffer.write(chunk, 0, received)
                 observation?.retained(buffer.size)
@@ -328,16 +349,16 @@ class HttpTransport private constructor(
             val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()
             callObservation?.raw(text)
-            Json.parseToJsonElement(text) as? JsonObject ?: throw ClientException("invalid_response", status, true)
+            Json.parseToJsonElement(text) as? JsonObject ?: throw ClientError("internal", status, true)
         } catch (_: CharacterCodingException) {
-            throw ClientException("invalid_response", status, true)
+            throw ClientError("internal", status, true)
         } catch (_: SerializationException) {
-            throw ClientException("invalid_response", status, true)
+            throw ClientError("internal", status, true)
         }
         if (status !in 200..299) {
             val error = json["error"] as? JsonPrimitive
             if (error == null || !error.isString || !errorPattern.matches(error.content)) {
-                throw ClientException("invalid_response", status, true)
+                throw ClientError("internal", status, true)
             }
             throw OperationError(error.content, status)
         }
@@ -347,7 +368,7 @@ class HttpTransport private constructor(
 
 private fun httpClient(timeout: Long): OkHttpClient {
     val network = NetworkCounter.current()
-    if (timeout !in 1..Int.MAX_VALUE.toLong()) throw ClientException("invalid_timeout")
+    if (timeout !in 1..Int.MAX_VALUE.toLong()) throw ClientError("invalid_argument")
     return OkHttpClient.Builder()
         // Responses the library closes before SDK callback handoff are still observed at actual source termination.
         .addNetworkInterceptor { chain ->

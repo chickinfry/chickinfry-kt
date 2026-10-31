@@ -50,7 +50,7 @@ Protocol JSON nesting is bounded at 256 to reject stack exhaustion.
 Calls have independent coroutines. Only complete stdout lines are serialized.
 Runtime entry, actual 401 handling and refresh participation drive barriers;
 the leader notification follows the actual flushed refresh request, before its
-response is required. Store state and revision come from MemorySessionStore.
+response is required. Store state and revision come from MemoryStore.
 Clear traces preserve incomplete null and actual CAS booleans. No driver code
 implements refresh merging, conditional deletion, case expectations or verdicts.
 

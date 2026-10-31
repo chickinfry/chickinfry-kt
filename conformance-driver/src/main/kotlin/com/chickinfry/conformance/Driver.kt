@@ -24,7 +24,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
     private val lock = Any()
     private val writer = Any()
     private val clients = mutableMapOf<String, Client>()
-    private val stores = mutableMapOf<String, MemorySessionStore>()
+    private val stores = mutableMapOf<String, MemoryStore>()
     private val traces = mutableMapOf<String, MutableList<ClearAttempt>>()
     private val barriers = mutableMapOf<String, Barrier>()
     private val pending = mutableMapOf<String, Arrival>()
@@ -146,22 +146,22 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             references.observeRaw(observation)
             observation.raw(args.string("origin"))
             try {
-                val client = NetworkCounter.capture(counter) {
-                    var transport = HttpTransport(args.string("origin"), args.long("requestTimeoutMs"))
-                    val storeRef = if ("storeRef" in args) args.ref("storeRef") else null
-                    if (storeRef != null) {
-                        val store = store(storeRef)
-                        observation.raw(store.origin)
-                        transport = transport.withSession(store)
-                    }
-                    if ("bearerRef" in args) transport = transport.withBearer(references.get(args.ref("bearerRef")))
-                    Client(fixture, transport, fixtures.create(fixture, transport), storeRef)
+                var transport = NetworkCounter.capture(counter) {
+                    HttpTransport(args.string("origin"), timeout = args.long("requestTimeoutMs"))
                 }
+                val storeRef = if ("storeRef" in args) args.ref("storeRef") else null
+                if (storeRef != null) {
+                    val store = store(storeRef)
+                    observation.raw(store.origin)
+                    transport = transport.withSession(store)
+                }
+                if ("bearerRef" in args) transport = transport.withBearer(references.get(args.ref("bearerRef")))
+                val client = Client(fixture, transport, fixtures.create(fixture, transport), storeRef)
                 synchronized(lock) {
                     if (clients.putIfAbsent(ref, client) != null) { client.transport.close(); throw DriverFailure("protocol_violation") }
                 }
                 buildJsonObject { put("clientRef", ref); put("constructorNetworkRequests", counter.snapshot()) }
-            } catch (failure: ClientException) { throw ConstructorFailure(failure, counter.snapshot(), observation) }
+            } catch (failure: ClientError) { throw ConstructorFailure(failure, counter.snapshot(), observation) }
         }
         "client.copy" -> {
             args.fields(common + setOf("sourceClientRef", "clientRef", "bearerRef"))
@@ -170,7 +170,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             val observation = CallObservation(id) {}
             references.observeRaw(observation)
             val transport = try { source.transport.withBearer(references.get(args.ref("bearerRef"))) }
-            catch (failure: ClientException) { throw ObservedFailure(failure, observation) }
+            catch (failure: ClientError) { throw ObservedFailure(failure, observation) }
             val copy = Client(source.fixture, transport, fixtures.create(source.fixture, transport), null)
             synchronized(lock) { if (clients.putIfAbsent(ref, copy) != null) throw DriverFailure("protocol_violation") }
             buildJsonObject { put("clientRef", ref) }
@@ -201,7 +201,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             try {
                 val result = withContext(observation + session) { client.bridge.call(args.string("operation"), JsonObject(input)) }
                 JsonObject(references.output(result, args.optionalObject("outputRefs")) + ("httpStatus" to (observation.httpStatus?.let(::JsonPrimitive) ?: JsonNull)))
-            } catch (failure: ClientException) { throw ObservedFailure(failure, observation) }
+            } catch (failure: ClientError) { throw ObservedFailure(failure, observation) }
             catch (failure: OperationError) { throw ObservedFailure(failure, observation) }
         }
         "client.observe" -> {
@@ -236,8 +236,8 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             val observation = CallObservation(id) {}
             references.observeRaw(observation)
             observation.raw(origin)
-            val store = try { MemorySessionStore(origin, if (supplied == 3) references.record(args, origin) else null) }
-            catch (failure: ClientException) { throw ObservedFailure(failure, observation) }
+            val store = try { MemoryStore(origin, if (supplied == 3) references.record(args, origin) else null) }
+            catch (failure: ClientError) { throw ObservedFailure(failure, observation) }
             synchronized(lock) {
                 if (stores.putIfAbsent(ref, store) != null) throw DriverFailure("protocol_violation")
                 traces[ref] = mutableListOf()
@@ -273,7 +273,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
     }
 
     private fun client(ref: String): Client = synchronized(lock) { clients[ref] ?: throw DriverFailure("invalid_reference") }
-    private fun store(ref: String): MemorySessionStore = synchronized(lock) { stores[ref] ?: throw DriverFailure("invalid_reference") }
+    private fun store(ref: String): MemoryStore = synchronized(lock) { stores[ref] ?: throw DriverFailure("invalid_reference") }
     private fun state(ref: String, includeTrace: Boolean): JsonObject {
         val snapshot = store(ref).snapshot()
         return buildJsonObject {
@@ -344,17 +344,17 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
     }
 
     private fun envelope(id: String, failure: Throwable): JsonObject {
-        val sdk = when (failure) { is ConstructorFailure -> failure.failure; is ObservedFailure -> failure.failure; is ClientException, is OperationError -> failure; else -> null }
+        val sdk = when (failure) { is ConstructorFailure -> failure.failure; is ObservedFailure -> failure.failure; is ClientError, is OperationError -> failure; else -> null }
         val observation = when (failure) {
             is ObservedFailure -> failure.observation
             is ConstructorFailure -> failure.observation
             else -> null
         }
-        val code = when (sdk) { is ClientException -> sdk.code; is OperationError -> sdk.code; else -> (failure as? DriverFailure)?.code ?: "driver_failed" }
-        val status = when (sdk) { is ClientException -> sdk.httpStatus; is OperationError -> sdk.httpStatus; else -> null }
+        val code = when (sdk) { is ClientError -> sdk.code; is OperationError -> sdk.code; else -> (failure as? DriverFailure)?.code ?: "driver_failed" }
+        val status = when (sdk) { is ClientError -> sdk.status; is OperationError -> sdk.status; else -> null }
         val unknown = when (sdk) {
-            is ClientException -> if (sdk.code in setOf("transport_error", "request_timeout")) observation?.outcomeUnknown else sdk.outcomeUnknown
-            is OperationError -> sdk.outcomeUnknown
+            is ClientError -> if (sdk.code in setOf("unavailable", "deadline_exceeded")) observation?.outcomeUnknown else sdk.outcomeUnknown
+            is OperationError -> false
             else -> null
         }
         return buildJsonObject {
@@ -376,5 +376,5 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
     }
 }
 
-private class ConstructorFailure(val failure: ClientException, val count: Long, val observation: CallObservation) : Exception("SDK construction failed.")
+private class ConstructorFailure(val failure: ClientError, val count: Long, val observation: CallObservation) : Exception("SDK construction failed.")
 private class ObservedFailure(val failure: Throwable, val observation: CallObservation) : Exception("SDK call failed.")

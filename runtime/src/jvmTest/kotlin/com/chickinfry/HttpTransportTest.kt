@@ -56,14 +56,14 @@ class HttpTransportTest {
         Peer { it.reply("{}") }.use { peer ->
             val transport = NetworkCounter.capture(counter) { HttpTransport(peer.origin) }
             assertEquals(0L, counter.snapshot())
-            assertFailsWith<ClientException> { NetworkCounter.capture(counter) { HttpTransport("not-an-origin") } }
+            assertFailsWith<ClientError> { NetworkCounter.capture(counter) { HttpTransport("not-an-origin") } }
             assertEquals(0L, counter.snapshot())
             val observation = CallObservation("counter") {}
             withContext(observation) { transport.invoke("probe.echo", emptyInput) { it } }
             assertTrue(counter.snapshot() > 0)
             assertEquals(listOf("probe.echo"), observation.transmissions())
             observation.raw("raw-body-secret")
-            assertFalse(observation.exposesRawDetails(ClientException("invalid_response")))
+            assertFalse(observation.exposesRawDetails(ClientError("internal")))
             assertTrue(observation.exposesRawDetails(IllegalStateException("raw-body-secret")))
             assertFalse(observation.exposesRawDetails(IllegalStateException("Safe failure.", IllegalArgumentException("Safe cause."))))
             assertTrue(observation.exposesRawDetails(object : IllegalStateException("raw-body-secret") {
@@ -89,12 +89,12 @@ class HttpTransportTest {
                 "http://127.0.0.256", "ftp://127.0.0.1", "https://", "https://%65xample.test",
             )
             rejects.forEach { origin ->
-                val failure = assertFailsWith<ClientException>(origin) {
+                val failure = assertFailsWith<ClientError>(origin) {
                     HttpTransport(origin).invoke("probe.echo", emptyInput) { it }
                 }
-                assertEquals("invalid_origin", failure.code, origin)
+                assertEquals("invalid_argument", failure.code, origin)
                 assertFalse(failure.outcomeUnknown)
-                assertNull(failure.httpStatus)
+                assertNull(failure.status)
                 assertNull(failure.cause)
                 assertFalse(failure.toString().contains(origin))
             }
@@ -117,8 +117,9 @@ class HttpTransportTest {
             assertEquals(REQUEST_LIMIT, boundary.toString().toByteArray().size)
             assertEquals("\ud55c\uae00 🎉", transport.invoke("probe.echo", boundary, ::requiredValue))
             val over = buildJsonObject { put("value", boundary["value"]!!.jsonPrimitive.content + "a") }
-            val failure = assertFailsWith<ClientException> { transport.invoke("probe.echo", over) { it } }
-            assertEquals("request_too_large", failure.code)
+            val failure = assertFailsWith<ClientError> { transport.invoke("probe.echo", over) { it } }
+            assertEquals("resource_exhausted", failure.code)
+            assertNull(failure.status)
             assertFalse(failure.outcomeUnknown)
             assertEquals(1, peer.requests.get())
             assertEquals(REQUEST_LIMIT, requests.single().size)
@@ -129,19 +130,67 @@ class HttpTransportTest {
     @Test
     fun invalidOperationTimeoutAndBearerNeverSend() = runBlocking {
         Peer { it.reply("{}") }.use { peer ->
-            listOf(0L, -1L, Long.MAX_VALUE).forEach {
-                assertEquals("invalid_timeout", assertFailsWith<ClientException> { HttpTransport(peer.origin, it) }.code)
+            listOf(0L, -1L, 2_147_483_648L, Long.MAX_VALUE).forEach {
+                val failure = assertFailsWith<ClientError> { HttpTransport(peer.origin, timeout = it) }
+                assertEquals("invalid_argument", failure.code)
+                assertNull(failure.status)
+                assertFalse(failure.outcomeUnknown)
             }
             val transport = HttpTransport(peer.origin)
             listOf("../probe.echo", "probe.echo?other", "probe/echo", "probe.echo\n").forEach {
-                val failure = assertFailsWith<ClientException> { transport.invoke(it, emptyInput) { json -> json } }
-                assertEquals("invalid_operation", failure.code)
+                val failure = assertFailsWith<ClientError> { transport.invoke(it, emptyInput) { json -> json } }
+                assertEquals("invalid_argument", failure.code)
+                assertNull(failure.status)
                 assertFalse(failure.outcomeUnknown)
             }
             listOf("", "bad", "x".repeat(42), "x".repeat(44), "x".repeat(42) + "\n").forEach {
-                assertEquals("invalid_token", assertFailsWith<ClientException> { transport.withBearer(it) }.code)
+                val failure = assertFailsWith<ClientError> { transport.withBearer(it) }
+                assertEquals("invalid_argument", failure.code)
+                assertNull(failure.status)
+                assertFalse(failure.outcomeUnknown)
             }
             assertEquals(0, peer.requests.get())
+        }
+    }
+
+    @Test
+    fun timeoutOptionUsesMillisecondsAndPreservesBoundsAndCopies() = runBlocking {
+        val field = HttpTransport::class.java.getDeclaredField("client").apply { isAccessible = true }
+        val origin = "https://api.example.com"
+        for ((transport, expected) in listOf(
+            HttpTransport(origin) to 30_000,
+            HttpTransport(origin, timeout = 1) to 1,
+            HttpTransport(origin, timeout = 2_147_483_647) to 2_147_483_647,
+        )) {
+            val bearer = transport.withBearer("a".repeat(43))
+            val session = transport.withSession(MemoryStore(origin, transportCredentials()))
+            try {
+                for (copy in listOf(transport, bearer, session)) {
+                    val client = field.get(copy) as OkHttpClient
+                    assertEquals(expected, client.callTimeoutMillis)
+                    assertEquals(expected, client.connectTimeoutMillis)
+                    assertEquals(expected, client.readTimeoutMillis)
+                    assertEquals(expected, client.writeTimeoutMillis)
+                }
+            } finally { transport.close() }
+        }
+    }
+
+    @Test
+    fun clientFailureMessagesUseSafeCodeAndReceivedStatus() {
+        val codes = listOf("invalid_argument", "failed_precondition", "resource_exhausted",
+            "deadline_exceeded", "canceled", "unavailable", "data_loss", "unimplemented",
+            "internal", "unknown", "unauthenticated")
+        for (code in codes) {
+            val local = ClientError(code)
+            assertEquals("Client failed ($code).", local.message)
+            assertNull(local.status)
+            assertFalse(local.outcomeUnknown)
+            assertNull(local.cause)
+            val received = ClientError(code, 503, true)
+            assertEquals("Client failed ($code, HTTP 503).", received.message)
+            assertEquals(503, received.status)
+            assertTrue(received.outcomeUnknown)
         }
     }
 
@@ -171,14 +220,14 @@ class HttpTransportTest {
                         events.add(it)
                         if (it.phase == "read" && it.readBytes == prefixSize.toLong()) prefixRead.countDown()
                     }, null, { sdk, source, received -> oracle += Triple(sdk.size, source.size, received) })
-                        .withSession(MemorySessionStore(peer.origin))
+                        .withSession(MemoryStore(peer.origin, transportCredentials()))
                     withContext(CallObservation("boundary", calls::add)) {
                     if (size == RESPONSE_LIMIT) {
                         assertEquals(size - 12, transport.invoke("probe.echo", emptyInput, ::requiredValue).length)
                     } else {
-                        val failure = assertFailsWith<ClientException> { transport.invoke("probe.echo", emptyInput) { it } }
-                        assertEquals("response_too_large", failure.code)
-                        assertEquals(200, failure.httpStatus)
+                        val failure = assertFailsWith<ClientError> { transport.invoke("probe.echo", emptyInput) { it } }
+                        assertEquals("resource_exhausted", failure.code)
+                        assertEquals(200, failure.status)
                         assertTrue(failure.outcomeUnknown)
                         assertStopped(events, "limit")
                         assertEquals(RESPONSE_LIMIT + 1L, events.last().readBytes)
@@ -241,8 +290,8 @@ class HttpTransportTest {
                     if (size == RESPONSE_LIMIT) {
                         assertEquals(size - 12, transport.invoke("probe.echo", emptyInput, ::requiredValue).length)
                     } else {
-                        assertEquals("response_too_large",
-                            assertFailsWith<ClientException> { transport.invoke("probe.echo", emptyInput) { it } }.code)
+                        assertEquals("resource_exhausted",
+                            assertFailsWith<ClientError> { transport.invoke("probe.echo", emptyInput) { it } }.code)
                         assertStopped(events, "limit")
                     }
                     }
@@ -262,11 +311,11 @@ class HttpTransportTest {
             RawPeer("HTTP/1.1 200 OK\r\nContent-Length: $declared\r\nConnection: close\r\n\r\n",
                 valueBody(RESPONSE_LIMIT + 4096).toByteArray()).use { peer ->
                 val events = events()
-                val failure = assertFailsWith<ClientException> {
+                val failure = assertFailsWith<ClientError> {
                     HttpTransport(peer.origin).observed(events::add).invoke("probe.echo", emptyInput, ::requiredValue)
                 }
-                assertEquals(if (declared < RESPONSE_LIMIT) "invalid_response" else "response_too_large", failure.code)
-                assertEquals(200, failure.httpStatus)
+                assertEquals(if (declared < RESPONSE_LIMIT) "internal" else "resource_exhausted", failure.code)
+                assertEquals(200, failure.status)
                 assertTrue(events.all { it.readBytes <= RESPONSE_LIMIT + 1L })
                 if (declared > RESPONSE_LIMIT) assertStopped(events, "limit")
                 assertEquals(1, peer.requests.get())
@@ -294,7 +343,7 @@ class HttpTransportTest {
                         }
                     }.use { peer ->
                         val transport = HttpTransport(peer.origin).let {
-                            if (session) it.withSession(MemorySessionStore(peer.origin)) else it
+                            if (session) it.withSession(MemoryStore(peer.origin, transportCredentials())) else it
                         }
                         val observation = CallObservation("redirect") {
                             events += it
@@ -306,10 +355,10 @@ class HttpTransportTest {
                             }
                             withContext(Dispatchers.IO) { assertTrue(headers.await(1, TimeUnit.SECONDS)) }
                             assertEquals("headers", events.first().phase)
-                            val failure = withTimeout(1000) { result.await() }.exceptionOrNull() as ClientException
-                            assertEquals("redirect_not_allowed", failure.code)
-                            assertEquals(status, failure.httpStatus)
-                            assertFalse(failure.outcomeUnknown)
+                            val failure = withTimeout(1000) { result.await() }.exceptionOrNull() as ClientError
+                            assertEquals("internal", failure.code)
+                            assertEquals(status, failure.status)
+                            assertTrue(failure.outcomeUnknown)
                             assertEquals(1, peer.requests.get())
                             assertEquals(listOf("headers", "cancel-requested", "cancel-observed", "reader-closed", "completed"),
                                 events.map { it.phase })
@@ -340,8 +389,7 @@ class HttpTransportTest {
                     withContext(CallObservation("retry", events::add)) { transport.invoke("probe.echo", emptyInput) { it } }
                 }
                 assertEquals("service_busy", failure.code)
-                assertEquals(503, failure.httpStatus)
-                assertFalse(failure.outcomeUnknown)
+                assertEquals(503, failure.status)
                 assertEquals(1, peer.requests.get())
                 assertTrue(events.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
                 assertFalse(events.any { it.phase.startsWith("cancel") })
@@ -356,30 +404,30 @@ class HttpTransportTest {
             "http://127.0.0.1:${it.localPort}"
         }
         val unsentEvents = events()
-        val unsent = assertFailsWith<ClientException> {
+        val unsent = assertFailsWith<ClientError> {
             HttpTransport(origin).observed(unsentEvents::add).invoke("probe.echo", emptyInput) { it }
         }
-        assertEquals("transport_error", unsent.code)
+        assertEquals("unavailable", unsent.code)
         assertFalse(unsent.outcomeUnknown)
-        assertNull(unsent.httpStatus)
+        assertNull(unsent.status)
         assertNull(unsent.cause)
         assertEquals(false, unsentEvents.last().outcomeUnknown)
         val secureEvents = mutableListOf<CallEvent>()
-        val secure = assertFailsWith<ClientException> {
+        val secure = assertFailsWith<ClientError> {
             withContext(CallObservation("https", secureEvents::add)) {
                 HttpTransport(origin.replace("http:", "https:")).invoke("probe.echo", emptyInput) { it }
             }
         }
-        assertEquals("transport_error", secure.code)
+        assertEquals("unavailable", secure.code)
         assertTrue(secureEvents.all { it.readBytes == null && it.retainedBytes == null && it.peakRetainedBytes == null })
         Peer { it.requestBody.readBytes(); it.close() }.use { peer ->
             val events = events()
-            val failure = assertFailsWith<ClientException> {
+            val failure = assertFailsWith<ClientError> {
                 HttpTransport(peer.origin).observed(events::add).invoke("probe.echo", emptyInput) { it }
             }
-            assertEquals("transport_error", failure.code)
+            assertEquals("unavailable", failure.code)
             assertTrue(failure.outcomeUnknown)
-            assertNull(failure.httpStatus)
+            assertNull(failure.status)
             assertNull(failure.cause)
             assertEquals(true, events.last().outcomeUnknown)
             assertEquals(1, peer.requests.get())
@@ -414,10 +462,10 @@ class HttpTransportTest {
                 val result = async { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
                 withContext(Dispatchers.IO) { assertTrue(entered.await(3, TimeUnit.SECONDS)) }
                 val failure = withTimeout(1500) { result.await() }.exceptionOrNull()
-                assertTrue(failure is ClientException)
-                assertEquals("request_timeout", failure.code)
+                assertTrue(failure is ClientError)
+                assertEquals("deadline_exceeded", failure.code)
                 assertTrue(failure.outcomeUnknown)
-                assertNull(failure.httpStatus)
+                assertNull(failure.status)
                 assertNull(events.last().outcomeUnknown)
                 assertEquals("completed", events.last().phase)
                 assertEquals(0, peer.requests.get())
@@ -478,9 +526,9 @@ class HttpTransportTest {
                     val result = async(observation) { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
                     withContext(Dispatchers.IO) { assertTrue(entered.await(3, TimeUnit.SECONDS)) }
                     val failure = withTimeout(1500) { result.await() }.exceptionOrNull()
-                    assertTrue(failure is ClientException)
-                    assertEquals("request_timeout", failure.code)
-                    assertEquals(307, failure.httpStatus)
+                    assertTrue(failure is ClientError)
+                    assertEquals("deadline_exceeded", failure.code)
+                    assertEquals(307, failure.status)
                     assertTrue(failure.outcomeUnknown)
                     assertEquals(listOf("headers", "cancel-requested", "cancel-observed", "completed"), events.map { it.phase })
                     assertTrue(events.all { it.httpStatus == 307 })
@@ -520,20 +568,19 @@ class HttpTransportTest {
             "{\"error\":\"bad\\n\"}", "[]", "null")
         for (body in bodies) {
             Peer { it.reply(body, 401) }.use { peer ->
-                val failure = assertFailsWith<ClientException> { HttpTransport(peer.origin).invoke("probe.echo", emptyInput) { it } }
-                assertEquals("invalid_response", failure.code, body)
-                assertEquals(401, failure.httpStatus)
+                val failure = assertFailsWith<ClientError> { HttpTransport(peer.origin).invoke("probe.echo", emptyInput) { it } }
+                assertEquals("internal", failure.code, body)
+                assertEquals(401, failure.status)
                 assertTrue(failure.outcomeUnknown)
-                assertEquals("Invalid operation response.", failure.message)
+                assertEquals("Client failed (internal, HTTP ${failure.status}).", failure.message)
                 assertNull(failure.cause)
             }
         }
         Peer { it.reply("{\"error\":\"future_business_error\",\"detail\":\"private detail\"}", 429) }.use { peer ->
             val failure = assertFailsWith<OperationError> { HttpTransport(peer.origin).invoke("probe.echo", emptyInput) { it } }
             assertEquals("future_business_error", failure.code)
-            assertEquals(429, failure.httpStatus)
-            assertFalse(failure.outcomeUnknown)
-            assertEquals("Operation failed.", failure.message)
+            assertEquals(429, failure.status)
+            assertEquals("Operation failed (future_business_error, HTTP 429).", failure.message)
             assertNull(failure.cause)
             assertFalse(failure.toString().contains("private detail"))
         }
@@ -546,14 +593,14 @@ class HttpTransportTest {
             byteArrayOf(123, 34, 118, 97, 108, 117, 101, 34, 58, 34, 0xc3.toByte(), 0x28, 34, 125))
         for (body in bodies) {
             Peer { it.reply(body, 201) }.use { peer ->
-                val failure = assertFailsWith<ClientException> {
+                val failure = assertFailsWith<ClientError> {
                     HttpTransport(peer.origin).invoke("probe.echo", emptyInput, ::requiredValue)
                 }
-                assertEquals("invalid_response", failure.code)
-                assertEquals(201, failure.httpStatus)
+                assertEquals("internal", failure.code)
+                assertEquals(201, failure.status)
                 assertTrue(failure.outcomeUnknown)
                 assertNull(failure.cause)
-                assertEquals("Invalid operation response.", failure.message)
+                assertEquals("Client failed (internal, HTTP ${failure.status}).", failure.message)
             }
         }
     }
@@ -620,10 +667,10 @@ class HttpTransportTest {
                         assertFailsWith<CancellationException> { result.await() }
                     } else {
                         val failure = withTimeout(1500) { result.await() }.exceptionOrNull()
-                        assertTrue(failure is ClientException)
-                        assertEquals("request_timeout", failure.code)
+                        assertTrue(failure is ClientError)
+                        assertEquals("deadline_exceeded", failure.code)
                         assertFalse(failure.outcomeUnknown)
-                        assertNull(failure.httpStatus)
+                        assertNull(failure.status)
                     }
                     assertEquals(5, peer.requests.get())
                     assertEquals(listOf("cancel-requested", "cancel-observed", "completed"), events.map { it.phase })
@@ -654,12 +701,12 @@ class HttpTransportTest {
                 it.close()
             }.use { peer ->
                 try {
-                    val failure = assertFailsWith<ClientException> {
+                    val failure = assertFailsWith<ClientError> {
                         HttpTransport(peer.origin, 300).observed(events::add).invoke("probe.echo", emptyInput) { it }
                     }
                     assertTrue(entered.await(1, TimeUnit.SECONDS))
-                    assertEquals("request_timeout", failure.code)
-                    assertEquals(if (headers) 200 else null, failure.httpStatus)
+                    assertEquals("deadline_exceeded", failure.code)
+                    assertEquals(if (headers) 200 else null, failure.status)
                     assertTrue(failure.outcomeUnknown)
                     assertEquals(1, peer.requests.get())
                     assertTrue(events.last().elapsedMs < 3000)
@@ -667,6 +714,40 @@ class HttpTransportTest {
                     release.countDown()
                 }
             }
+        }
+    }
+
+    @Test
+    fun transportAbortWithoutCallerCancellationIsCanceledWithReceivedStatus() = runBlocking {
+        val read = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        Peer {
+            it.sendResponseHeaders(200, 0)
+            it.responseBody.write('{'.code)
+            it.responseBody.flush()
+            release.await(5, TimeUnit.SECONDS)
+            it.close()
+        }.use { peer ->
+            lateinit var client: OkHttpClient
+            var call: Call? = null
+            val transport = HttpTransport(peer.origin).observed(
+                { if (it.phase == "read") read.countDown() },
+                { call = client.dispatcher.runningCalls().single() },
+            )
+            val field = HttpTransport::class.java.getDeclaredField("client").apply { isAccessible = true }
+            client = field.get(transport) as OkHttpClient
+            try {
+                val result = async { runCatching { transport.invoke("probe.echo", emptyInput) { it } } }
+                withContext(Dispatchers.IO) { assertTrue(read.await(3, TimeUnit.SECONDS)) }
+                assertNotNull(call).cancel()
+                val failure = withTimeout(1500) { result.await() }.exceptionOrNull()
+                assertTrue(failure is ClientError)
+                assertEquals("canceled", failure.code)
+                assertEquals(200, failure.status)
+                assertTrue(failure.outcomeUnknown)
+                assertNull(failure.cause)
+                assertEquals(1, peer.requests.get())
+            } finally { release.countDown(); transport.close() }
         }
     }
 
@@ -777,3 +858,5 @@ private class RawPeer(headers: String, body: ByteArray) : AutoCloseable {
     }.apply { isDaemon = true; start() }
     override fun close() { server.close(); worker.join(3000) }
 }
+
+private fun transportCredentials() = SessionCredentials("a".repeat(43), "b".repeat(43), "expires", "refresh-expires", "user", "session")

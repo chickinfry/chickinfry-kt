@@ -40,10 +40,11 @@ class SessionTransportTest {
                 else -> "{}"
             })
         }.use { peer ->
-            val store = MemorySessionStore(peer.origin)
+            val store = MemoryStore(peer.origin)
             val anonymous = HttpTransport(peer.origin)
+            val signedUp = anonymous.invoke("auth.signup", empty) { WireResponse(it, 200).credentials() }
+            assertTrue(store.compareAndSet(null, signedUp))
             val session = anonymous.withSession(store)
-            session.invoke("auth.signup", empty) { it }
             assertEquals(first, store.read())
             assertEquals(1L, store.snapshot().revision)
             session.invoke("probe.echo", empty) { it }
@@ -66,10 +67,32 @@ class SessionTransportTest {
                 assertFalse(it.contains(first.accessToken))
                 assertFalse(it.contains(first.refreshToken))
             }
-            assertEquals("invalid_origin", assertFailsWith<ClientException> {
-                anonymous.withSession(MemorySessionStore("https://other.example"))
+            assertEquals("failed_precondition", assertFailsWith<ClientError> {
+                anonymous.withSession(MemoryStore("https://other.example"))
             }.code)
             assertEquals(6, peer.requests.get())
+        }
+    }
+
+    @Test
+    fun missingSessionAndMalformedCredentialsFailBeforeSending() = runBlocking {
+        SessionPeer { it.respond("{}") }.use { peer ->
+            val transport = HttpTransport(peer.origin)
+            val missing = assertFailsWith<ClientError> { transport.withSession(MemoryStore(peer.origin)) }
+            assertEquals("unauthenticated", missing.code)
+            assertNull(missing.status)
+            assertFalse(missing.outcomeUnknown)
+            val invalid = assertFailsWith<ClientError> { credentials('a').copy(accessToken = "bad") }
+            assertEquals("invalid_argument", invalid.code)
+            assertNull(invalid.status)
+            assertFalse(invalid.outcomeUnknown)
+            val session = transport.withSession(MemoryStore(peer.origin, credentials('a')))
+            val malformed = assertFailsWith<ClientError> { session.invoke("auth.refresh", empty) { it } }
+            assertEquals("invalid_argument", malformed.code)
+            assertNull(malformed.status)
+            assertFalse(malformed.outcomeUnknown)
+            assertEquals(0, peer.requests.get())
+            transport.close()
         }
     }
 
@@ -98,7 +121,7 @@ class SessionTransportTest {
                     } else exchange.respond("{\"value\":\"ok\"}")
                 }
             }.use { peer ->
-                val store = MemorySessionStore(peer.origin, original)
+                val store = MemoryStore(peer.origin, original)
                 val session = HttpTransport(peer.origin).withSession(store)
                 if (rejectReplay) {
                     val failure = assertFailsWith<OperationError> { session.invoke("probe.echo", input) { it } }
@@ -116,7 +139,7 @@ class SessionTransportTest {
         val original = credentials('a')
         for ((code, status) in listOf("invalid_token" to 403, "forbidden" to 401, "service_busy" to 500)) {
             SessionPeer { it.respond("{\"error\":\"$code\"}", status) }.use { peer ->
-                val store = MemorySessionStore(peer.origin, original)
+                val store = MemoryStore(peer.origin, original)
                 val events = mutableListOf<CallEvent>()
                 val failure = assertFailsWith<OperationError> {
                     withContext(CallObservation("original", events::add)) {
@@ -127,18 +150,16 @@ class SessionTransportTest {
                 assertEquals(1, events.count { it.phase == "headers" })
                 assertEquals(1, events.count { it.phase == "completed" })
                 assertEquals(code, failure.code)
-                assertFalse(failure.outcomeUnknown)
                 assertEquals(1, peer.requests.get())
                 assertEquals(original, store.read())
             }
         }
         SessionPeer { it.respond("{\"error\":\"invalid_token\"}", 401) }.use { peer ->
-            val store = MemorySessionStore(peer.origin, original)
+            val store = MemoryStore(peer.origin, original)
             val failure = assertFailsWith<OperationError> {
                 HttpTransport(peer.origin).withSession(store).invoke("auth.refresh", refreshInput(original)) { it }
             }
-            assertEquals(401, failure.httpStatus)
-            assertFalse(failure.outcomeUnknown)
+            assertEquals(401, failure.status)
             assertNull(store.read())
             assertEquals(1, peer.requests.get())
         }
@@ -178,33 +199,35 @@ class SessionTransportTest {
                 }
             }.use { peer ->
                 try {
-                    val store = MemorySessionStore(peer.origin, original)
+                    val store = MemoryStore(peer.origin, original)
                     val session = HttpTransport(peer.origin, 500).withSession(store)
-                    val failure = try {
-                        session.invoke("probe.echo", empty) { it }
-                        error("Expected refresh failure.")
-                    } catch (failure: OperationError) {
-                        assertEquals(variant.toInt(), failure.httpStatus)
-                        assertTrue(failure.outcomeUnknown)
-                        failure
-                    } catch (failure: ClientException) {
-                        assertEquals(when (variant) { "corrupt-401" -> 401; "corrupt-200", "body-timeout" -> 200; else -> null },
-                            failure.httpStatus, variant)
-                        assertTrue(failure.outcomeUnknown)
-                        assertNull(failure.cause)
-                        failure
-                    }
+                    val failure = assertFailsWith<ClientError> { session.invoke("probe.echo", empty) { it } }
+                    assertEquals(when (variant) {
+                        "timeout", "disconnect" -> null
+                        "body-timeout", "corrupt-200" -> 200
+                        "corrupt-401" -> 401
+                        else -> variant.toInt()
+                    }, failure.status, variant)
+                    assertEquals(when (variant) {
+                        "timeout", "body-timeout" -> "deadline_exceeded"
+                        "disconnect" -> "unavailable"
+                        "corrupt-401", "corrupt-200" -> "internal"
+                        else -> "unauthenticated"
+                    }, failure.code, variant)
+                    assertTrue(failure.outcomeUnknown)
+                    assertNull(failure.cause)
                     assertFalse(failure.toString().contains(original.refreshToken))
-                    assertEquals(original, store.read())
+                    assertNull(store.read())
+                    assertTrue(store.compareAndSet(null, original))
                     assertTrue(store.compareAndSet(original, original))
                     val next = HttpTransport(peer.origin).withSession(store)
                     for (operation in listOf("probe.echo", "auth.refresh")) {
-                        val blocked = assertFailsWith<ClientException> {
+                        val blocked = assertFailsWith<ClientError> {
                             next.invoke(operation, if (operation == "auth.refresh") refreshInput(original) else empty) { it }
                         }
-                        assertEquals("invalid_token", blocked.code)
-                        assertTrue(blocked.outcomeUnknown)
-                        assertNull(blocked.httpStatus)
+                        assertEquals("unauthenticated", blocked.code)
+                        assertFalse(blocked.outcomeUnknown)
+                        assertNull(blocked.status)
                     }
                     assertEquals(1, refreshes.get(), variant)
                     assertEquals(2, peer.requests.get(), variant)
@@ -244,7 +267,7 @@ class SessionTransportTest {
                 exchange.respond("{\"error\":\"invalid_token\"}", 401)
             } else exchange.respond("{}")
         }.use { peer ->
-            val store = MemorySessionStore(peer.origin, original)
+            val store = MemoryStore(peer.origin, original)
             val transport = HttpTransport(peer.origin, 2500).withSession(store)
             val startedAt = System.nanoTime()
             try {
@@ -305,7 +328,7 @@ class SessionTransportTest {
             }
         }.use { peer ->
             try {
-                val store = MemorySessionStore(peer.origin, original)
+                val store = MemoryStore(peer.origin, original)
                 fun observation(id: String) = SessionObservation(id, { event ->
                     when (event.point) {
                         "both-originals-rejected" -> rejected.incrementAndGet()
@@ -345,8 +368,7 @@ class SessionTransportTest {
                 withTimeout(1000) { workers[0].join() }
                 assertTrue(workers[0].isCompleted)
                 if (refreshStatus == 200) assertEquals(rotated, store.read())
-                else if (refreshStatus == 401) assertNull(store.read())
-                else assertEquals(original, store.read())
+                else assertNull(store.read())
                 if (cancelFirst) {
                     val completed = events.getValue("first").single { it.phase == "completed" }
                     assertNull(completed.httpStatus)
@@ -403,7 +425,7 @@ class SessionTransportTest {
                 }
             }.use { peer ->
                 try {
-                    val store = MemorySessionStore(peer.origin, original)
+                    val store = MemoryStore(peer.origin, original)
                     val session = HttpTransport(peer.origin).withSession(store)
                     val oldCall = async(SessionObservation("old", {}, clears::add)) {
                         runCatching { session.invoke("probe.echo", empty) { it } }
@@ -414,14 +436,12 @@ class SessionTransportTest {
                     assertEquals(2L, store.snapshot().revision)
                     release.countDown()
                     val failure = withTimeout(3000) { oldCall.await() }.exceptionOrNull()
-                    assertTrue(if (reject) failure is OperationError else failure is ClientException)
+                    assertTrue(if (reject) failure is OperationError else failure is ClientError)
                     assertEquals(login, store.read())
                     assertEquals(2L, store.snapshot().revision)
                     assertEquals(1, originals.get())
-                    if (reject) {
-                        assertEquals(listOf(null, false), clears.map { it.removed })
-                        assertTrue(clears.all { it.expected == original && it.callId == "old" })
-                    } else assertTrue(clears.isEmpty())
+                    assertEquals(listOf(null, false), clears.map { it.removed })
+                    assertTrue(clears.all { it.expected == original && it.callId == "old" })
                 } finally { release.countDown() }
             }
         }
@@ -431,22 +451,23 @@ class SessionTransportTest {
     fun malformedLoginAndStorageFailuresNeverBecomeAnonymousOrExposeDetails() = runBlocking {
         val original = credentials('a')
         SessionPeer { it.respond("{\"access_token\":\"${original.accessToken}\"}", 201) }.use { peer ->
-            val store = MemorySessionStore(peer.origin)
-            val failure = assertFailsWith<ClientException> {
+            val store = MemoryStore(peer.origin, original)
+            val failure = assertFailsWith<ClientError> {
                 HttpTransport(peer.origin).withSession(store).invoke("auth.signin", empty) { it }
             }
-            assertEquals("invalid_response", failure.code)
-            assertEquals(201, failure.httpStatus)
-            assertNull(store.read())
+            assertEquals("internal", failure.code)
+            assertEquals(201, failure.status)
+            assertEquals(original, store.read())
             val broken = object : SessionStore {
                 override val origin = peer.origin
                 override suspend fun read(): SessionCredentials? = error("Private credential ${original.refreshToken}")
                 override suspend fun compareAndSet(expected: SessionCredentials?, replacement: SessionCredentials?) = false
             }
-            val storage = assertFailsWith<ClientException> {
+            val storage = assertFailsWith<ClientError> {
                 HttpTransport(peer.origin).withSession(broken).invoke("probe.echo", empty) { it }
             }
-            assertEquals("session_storage_error", storage.code)
+            assertEquals("failed_precondition", storage.code)
+            assertNull(storage.status)
             assertFalse(storage.outcomeUnknown)
             assertNull(storage.cause)
             assertFalse(storage.toString().contains(original.refreshToken))
@@ -473,7 +494,7 @@ class SessionTransportTest {
             } else exchange.respond("{}")
         }.use { peer ->
             try {
-                val store = MemorySessionStore(peer.origin, original)
+                val store = MemoryStore(peer.origin, original)
                 val first = HttpTransport(peer.origin).withSession(store)
                 val second = HttpTransport(peer.origin).withSession(store)
                 fun observe(id: String) = SessionObservation(id, { if (it.point == "refresh-joined") joins.countDown() })
@@ -489,8 +510,9 @@ class SessionTransportTest {
             } finally { release.countDown() }
         }
         SessionPeer { it.respond(wire(rotated).toString()) }.use { peer ->
-            val store = MemorySessionStore(peer.origin)
-            HttpTransport(peer.origin).withSession(store).invoke("auth.refresh", refreshInput(original)) { it }
+            val store = MemoryStore(peer.origin)
+            val refreshed = HttpTransport(peer.origin).invoke("auth.refresh", refreshInput(original)) { WireResponse(it, 200).credentials() }
+            assertTrue(store.compareAndSet(null, refreshed))
             assertEquals(rotated, store.read())
             assertEquals(1, peer.requests.get())
         }
@@ -498,14 +520,17 @@ class SessionTransportTest {
 
     @Test
     fun refreshStorageFailureSuspendsConsumedTokenAndPreservesSafeError() = runBlocking {
-        for (timeout in listOf(false, true)) {
+        for ((timeout, refreshStatus) in listOf(false to 200, true to 200, false to 401, true to 401)) {
             val original = credentials('a')
             val rotated = credentials('c')
             SessionPeer { exchange ->
-                if (exchange.requestURI.path == "/auth.refresh") exchange.respond(wire(rotated).toString())
+                if (exchange.requestURI.path == "/auth.refresh") {
+                    if (refreshStatus == 401) exchange.respond("{\"error\":\"invalid_token\"}", 401)
+                    else exchange.respond(wire(rotated).toString())
+                }
                 else exchange.respond("{\"error\":\"invalid_token\"}", 401)
             }.use { peer ->
-                val backing = MemorySessionStore(peer.origin, original)
+                val backing = MemoryStore(peer.origin, original)
                 val broken = object : SessionStore {
                     override val origin = peer.origin
                     override suspend fun read() = backing.read()
@@ -516,24 +541,83 @@ class SessionTransportTest {
                 }
                 val session = HttpTransport(peer.origin, 500).withSession(broken)
                 val observed = mutableListOf<CallEvent>()
-                val failure = assertFailsWith<ClientException> {
+                val failure = assertFailsWith<ClientError> {
                     withContext(CallObservation("storage", observed::add)) { session.invoke("probe.echo", empty) { it } }
                 }
-                assertEquals(200, observed.last().httpStatus)
+                assertEquals(refreshStatus, observed.last().httpStatus)
                 assertEquals(1, observed.count { it.phase == "completed" })
-                assertTrue(observed.filter { it.phase != "read" }.all { it.httpStatus == 200 })
-                assertEquals(if (timeout) "request_timeout" else "session_storage_error", failure.code)
-                assertTrue(failure.outcomeUnknown)
-                assertEquals(200, failure.httpStatus)
+                assertTrue(observed.filter { it.phase != "read" }.all { it.httpStatus == refreshStatus })
+                assertEquals(if (timeout && refreshStatus != 401) "deadline_exceeded" else "failed_precondition", failure.code)
+                assertEquals(refreshStatus != 401, failure.outcomeUnknown)
+                assertEquals(refreshStatus, failure.status)
                 assertNull(failure.cause)
                 assertFalse(failure.toString().contains(original.refreshToken))
                 assertTrue(backing.compareAndSet(original, original.copy(expiresAt = "changed")))
-                val blocked = assertFailsWith<ClientException> {
+                val blocked = assertFailsWith<ClientError> {
                     HttpTransport(peer.origin).withSession(broken).invoke("probe.echo", empty) { it }
                 }
-                assertEquals("invalid_token", blocked.code)
-                assertTrue(blocked.outcomeUnknown)
+                assertEquals("unauthenticated", blocked.code)
+                assertNull(blocked.status)
+                assertFalse(blocked.outcomeUnknown)
                 assertEquals(2, peer.requests.get())
+            }
+        }
+    }
+
+    @Test
+    fun timedOutRefreshAttemptsCleanupWithItsOwnFiniteDeadline() = runBlocking {
+        for (cleanupTimesOut in listOf(false, true)) {
+            val original = credentials('a')
+            val release = CountDownLatch(1)
+            val cleanupAttempts = AtomicInteger()
+            val cleanupCancelled = CompletableDeferred<Unit>()
+            SessionPeer { exchange ->
+                if (exchange.requestURI.path == "/auth.refresh") {
+                    exchange.requestBody.readBytes()
+                    exchange.sendResponseHeaders(200, 0)
+                    exchange.responseBody.write('{'.code)
+                    exchange.responseBody.flush()
+                    release.await(5, TimeUnit.SECONDS)
+                    exchange.close()
+                } else exchange.respond("{\"error\":\"invalid_token\"}", 401)
+            }.use { peer ->
+                val backing = MemoryStore(peer.origin, original)
+                val store = object : SessionStore {
+                    override val origin = peer.origin
+                    override suspend fun read() = backing.read()
+                    override suspend fun compareAndSet(expected: SessionCredentials?, replacement: SessionCredentials?): Boolean {
+                        cleanupAttempts.incrementAndGet()
+                        if (cleanupTimesOut) {
+                            try { CompletableDeferred<Unit>().await() }
+                            finally { cleanupCancelled.complete(Unit) }
+                        }
+                        return backing.compareAndSet(expected, replacement)
+                    }
+                }
+                val transport = HttpTransport(peer.origin, timeout = 250)
+                try {
+                    val session = transport.withSession(store)
+                    val failure = assertFailsWith<ClientError> {
+                        withTimeout(3000) { session.invoke("probe.echo", empty) { it } }
+                    }
+                    assertEquals("deadline_exceeded", failure.code)
+                    assertEquals(200, failure.status)
+                    assertTrue(failure.outcomeUnknown)
+                    assertEquals(1, cleanupAttempts.get())
+                    assertEquals(cleanupTimesOut, cleanupCancelled.isCompleted)
+                    if (cleanupTimesOut) assertEquals(original, backing.read()) else {
+                        assertNull(backing.read())
+                        assertTrue(backing.compareAndSet(null, original))
+                    }
+                    val blocked = assertFailsWith<ClientError> {
+                        session.invoke("probe.echo", empty) { it }
+                    }
+                    assertEquals("unauthenticated", blocked.code)
+                    assertNull(blocked.status)
+                    assertFalse(blocked.outcomeUnknown)
+                    assertEquals(2, peer.requests.get())
+                    assertEquals(1, cleanupAttempts.get())
+                } finally { release.countDown(); transport.close() }
             }
         }
     }
@@ -560,7 +644,7 @@ class SessionTransportTest {
                     }
                 }
             }.use { peer ->
-                val store = MemorySessionStore(peer.origin, original)
+                val store = MemoryStore(peer.origin, original)
                 val session = HttpTransport(peer.origin).withSession(store)
                 val late = async(SessionObservation("late", { event ->
                     if (event.point == "both-originals-rejected") {
@@ -574,7 +658,7 @@ class SessionTransportTest {
                     if (newLogin) session.invoke("auth.signin", empty) { it }
                     release.complete(Unit)
                     val result = withTimeout(3000) { late.await() }
-                    if (newLogin) assertTrue(result.exceptionOrNull() is ClientException) else result.getOrThrow()
+                    if (newLogin) assertTrue(result.exceptionOrNull() is ClientError) else result.getOrThrow()
                     assertEquals(1, refreshes.get())
                     assertEquals(if (newLogin) 3 else 4, originals.get())
                     assertEquals(if (newLogin) login else rotated, store.read())
@@ -597,7 +681,7 @@ class SessionTransportTest {
             } else exchange.respond("{}")
         }.use { peer ->
             class ValueEqualStore : SessionStore {
-                private val backing = MemorySessionStore(peer.origin, original)
+                private val backing = MemoryStore(peer.origin, original)
                 override val origin = peer.origin
                 override suspend fun read() = backing.read()
                 override suspend fun compareAndSet(expected: SessionCredentials?, replacement: SessionCredentials?) =

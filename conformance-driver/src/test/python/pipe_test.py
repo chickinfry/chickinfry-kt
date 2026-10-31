@@ -96,7 +96,7 @@ for fixture in ('plain', 'auth'):
             assert response['result']['constructorNetworkRequests'] == 0
         else:
             assert response['error']['kind'] == 'sdk'
-            assert response['error']['code'] == 'transport_error'
+            assert response['error']['code'] == 'unavailable'
             assert response['error']['httpStatus'] is None
             assert response['error']['outcomeUnknown'] is False
             assert response['error']['rawTransportDetails'] is False

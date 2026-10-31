@@ -3,8 +3,8 @@ package com.chickinfry.conformance
 import com.chickinfry.CallEvent
 import com.chickinfry.CallObservation
 import com.chickinfry.NetworkCounter
-import com.chickinfry.ClientTransport
-import com.chickinfry.MemorySessionStore
+import com.chickinfry.Transport
+import com.chickinfry.MemoryStore
 import com.chickinfry.SessionStore
 import java.io.Closeable
 import java.io.PipedInputStream
@@ -81,8 +81,8 @@ class DriverTest {
         fixtures().use { fixtures ->
             val clients = mutableListOf<Class<*>>()
             val stores = mutableListOf<Class<*>>()
-            val store = MemorySessionStore("http://127.0.0.1")
-            val transport = object : ClientTransport {
+            val store = MemoryStore("http://127.0.0.1")
+            val transport = object : Transport {
                 override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T {
                     val loader = Thread.currentThread().contextClassLoader
                     assertSame(SessionStore::class.java, loader.loadClass(SessionStore::class.java.name))
@@ -97,9 +97,9 @@ class DriverTest {
                 val bridge = fixtures.create(fixture, transport)
                 val loader = bridge.javaClass.classLoader
                 clients += loader.loadClass("com.chickinfry.client.Client")
-                assertSame(ClientTransport::class.java, loader.loadClass(ClientTransport::class.java.name))
+                assertSame(Transport::class.java, loader.loadClass(Transport::class.java.name))
                 assertSame(SessionStore::class.java, loader.loadClass(SessionStore::class.java.name))
-                assertSame(MemorySessionStore::class.java, loader.loadClass(MemorySessionStore::class.java.name))
+                assertSame(MemoryStore::class.java, loader.loadClass(MemoryStore::class.java.name))
                 assertEquals("id", bridge.call("probe.identify", buildJsonObject { put("id", "id") }).string("id"))
                 assertEquals(JsonArray(emptyList()), bridge.call("probe.list", buildJsonObject { put("wire_value", "ok") })["rows"])
                 assertFailsWith<DriverFailure> { bridge.call("probe.identify", buildJsonObject { put("id", "id"); put("unknown", "value") }) }
@@ -111,7 +111,7 @@ class DriverTest {
 
     @Test fun typedBridgesRejectInvalidEchoInputsWhileListIgnoresInput() = runBlocking {
         fixtures().use { fixtures ->
-            val transport = object : ClientTransport {
+            val transport = object : Transport {
                 override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T =
                     if (operation == "probe.echo") decode(buildJsonObject { put("wire_value", input.string("wire_value")); put("observed_at", "2026-01-01T00:00:00Z") })
                     else { assertTrue(input.isEmpty()); decode(buildJsonObject { put("rows", JsonArray(emptyList())) }) }

@@ -1,12 +1,12 @@
 package com.chickinfry.conformance.plain
 
-import com.chickinfry.ClientTransport
+import com.chickinfry.Transport
 import com.chickinfry.client.*
 import com.chickinfry.conformance.*
 import kotlinx.serialization.json.*
 
 class Factory : BridgeFactory {
-    override fun create(transport: ClientTransport): Bridge = TypedBridge(Client(transport))
+    override fun create(transport: Transport): Bridge = TypedBridge(Client(transport))
 }
 
 private class TypedBridge(private val client: Client) : Bridge {
