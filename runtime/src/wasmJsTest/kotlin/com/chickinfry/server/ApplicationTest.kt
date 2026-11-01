@@ -24,6 +24,26 @@ import kotlin.test.assertSame
 
 class ApplicationTest {
     @Test
+    fun invalidLogLevelRemainsAProgrammingError(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        val context = Context(1.0, "POST", "/greeting.echo")
+        assertFailsWith<IllegalArgumentException> { context.log("private message", "invalid") }
+        assertEquals(0, context.droppedLogs)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun logErrorResponseDoesNotFailHandler(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        assertLogFailureKeepsResponse(false)
+        "passed".toJsString()
+    }
+
+    @Test
+    fun logRejectionDoesNotFailHandler(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        assertLogFailureKeepsResponse(true)
+        "passed".toJsString()
+    }
+
+    @Test
     fun ownKeysDistinguishNullFromAbsentAndUndefined() {
         val input = presenceFixture()
         assertFalse(hasField(input, "missing"))
@@ -473,3 +493,23 @@ private external fun corruptDefault(input: JsonObject)
 
 private suspend fun Application.request(authorization: String = "", body: String = "{}"): String =
     handle(1.0, "POST", "/greeting.echo", "application/json", authorization, body, 0).await().toString()
+
+@JsFun("(reject) => { globalThis.previousLogHost = globalThis.__chik; globalThis.__chik = {log: async () => { if (reject) throw new Error('private credential'); return new TextEncoder().encode('{\"error\":\"log_failed\"}'); }}; }")
+private external fun installLogMock(reject: Boolean)
+
+@JsFun("() => { globalThis.__chik = globalThis.previousLogHost; delete globalThis.previousLogHost; }")
+private external fun restoreLogMock()
+
+private suspend fun assertLogFailureKeepsResponse(reject: Boolean) {
+    installLogMock(reject)
+    try {
+        val app = Application({ true }) { context, _ ->
+            context.log("private message")
+            assertEquals(1, context.droppedLogs)
+            buildJsonObject { put("message", "accepted") }
+        }
+        assertEquals("{\"status\":200,\"body\":{\"message\":\"accepted\"}}", app.request())
+    } finally {
+        restoreLogMock()
+    }
+}

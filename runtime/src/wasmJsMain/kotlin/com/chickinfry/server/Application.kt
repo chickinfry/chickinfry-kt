@@ -2,6 +2,7 @@
 
 package com.chickinfry.server
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +17,9 @@ import kotlin.js.toJsString
 
 /** Kotlin server targets do not support platform authentication yet; the context carries no session. */
 open class Context(val requestId: Double, val method: String, val path: String) {
+    internal var droppedLogs = 0
+        private set
+
     suspend fun environment(name: String): String? {
         val text = hostEnvironment("{\"rid\":${requestId.toLong()},\"name\":${jsonValue(name)}}".toJsString()).await().toString()
         val value = parseInput(text.toJsString()) ?: error("Invalid environment response")
@@ -24,7 +28,13 @@ open class Context(val requestId: Double, val method: String, val path: String) 
     }
     suspend fun log(message: String, level: String = "info") {
         require(level in listOf("debug", "info", "warn", "error"))
-        check(hostLog("{\"rid\":${requestId.toLong()},\"level\":${jsonValue(level)},\"message\":${jsonValue(message)}}".toJsString()).await().toString() == "{}")
+        try {
+            check(hostLog("{\"rid\":${requestId.toLong()},\"level\":${jsonValue(level)},\"message\":${jsonValue(message)}}".toJsString()).await().toString() == "{}")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            droppedLogs++
+        }
     }
 }
 
