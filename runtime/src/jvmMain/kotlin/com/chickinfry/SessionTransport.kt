@@ -43,6 +43,12 @@ internal class WireResponse(val json: JsonObject, val status: Int) {
             string("user_id"), string("session_id"))
     }
 
+    fun signedInCredentials(operation: String): SessionCredentials? = when {
+        operation == "auth.signin" -> credentials()
+        operation == "auth.signup" && ("access_token" in json || "refresh_token" in json) -> credentials()
+        else -> null
+    }
+
     override fun toString(): String = "WireResponse"
 }
 
@@ -57,6 +63,7 @@ private class SessionCoordination {
     val mutex = Mutex()
     val flights = mutableMapOf<String, RefreshFlight>()
     val suspended = mutableSetOf<String>()
+    var uncertainClear: String? = null
 }
 
 private val coordinations = mutableListOf<Pair<WeakReference<SessionStore>, SessionCoordination>>()
@@ -71,6 +78,7 @@ private fun coordination(store: SessionStore): SessionCoordination = synchronize
 internal suspend fun invokeSession(
     store: SessionStore,
     operation: String,
+    publicOperation: Boolean,
     bytes: ByteArray,
     timeoutMillis: Long,
     observation: SessionObservation?,
@@ -78,22 +86,22 @@ internal suspend fun invokeSession(
     send: suspend (String, ByteArray, String?, (CallObservation.Exchange?) -> Unit) -> WireResponse,
 ): WireResponse {
     val state = coordination(store)
-    val expected = read(store)
+    val expected = state.mutex.withLock {
+        val current = readSession(store)
+        if (current == null) {
+            if (state.uncertainClear != null) throw ClientError("unauthenticated")
+        } else {
+            if (current.refreshToken in state.suspended) throw ClientError("unauthenticated")
+            state.uncertainClear = null
+        }
+        current
+    }
+    if (expected == null && (!publicOperation || operation == "auth.refresh")) throw ClientError("unauthenticated")
+
     suspend fun selectedSend(token: String?): WireResponse {
         var exchange: CallObservation.Exchange? = null
         try { return send(operation, bytes, token) { exchange = it } }
         finally { callObservation?.select(exchange) }
-    }
-    if (operation == "auth.signup" || operation == "auth.signin") {
-        val response = selectedSend(expected?.accessToken)
-        val replacement = response.credentials()
-        if (!replace(store, expected, replacement, response.status)) {
-            throw ClientError("unauthenticated")
-        }
-        return response
-    }
-    if (expected != null && state.mutex.withLock { expected.refreshToken in state.suspended }) {
-        throw ClientError("unauthenticated")
     }
     if (operation == "auth.refresh") {
         // Explicit refresh shares the single-consumption path with automatic refresh of the same credentials.
@@ -124,6 +132,9 @@ internal suspend fun invokeSession(
         callObservation?.select(exchange)
         throw failure
     }
+    response.signedInCredentials(operation)?.let { replacement ->
+        if (!replace(store, used, replacement, response.status)) throw ClientError("unauthenticated")
+    }
     if (operation == "auth.logout") clear(store, used, observation, response.status)
     return response
 }
@@ -145,7 +156,7 @@ private suspend fun refresh(
         val existing = state.flights[refreshToken]
         if (existing != null) Triple(existing, !existing.result.isCompleted, false) else {
             if (expected != null && expected.refreshToken != refreshToken) throw ClientError("unauthenticated")
-            if (read(store) != expected) throw ClientError("unauthenticated")
+            if (readSession(store) != expected) throw ClientError("unauthenticated")
             // Retire completed flights so past credentials do not accumulate on every rotation.
             state.flights.entries.removeAll { it.value.result.isCompleted }
             val created = RefreshFlight().also { created ->
@@ -182,7 +193,10 @@ private suspend fun refresh(
                                     ClientError("failed_precondition", failure.status)
                                 }
                             } else {
-                                state.mutex.withLock { state.suspended += refreshToken }
+                                state.mutex.withLock {
+                                    state.suspended += refreshToken
+                                    if (refreshToken == expected?.refreshToken) state.uncertainClear = refreshToken
+                                }
                                 val error = when (failure) {
                                     is ClientError -> failure
                                     is CancellationException -> ClientError("deadline_exceeded", status, outcomeUnknown = true)
@@ -191,7 +205,9 @@ private suspend fun refresh(
                                 try {
                                     if (refreshToken == expected?.refreshToken) {
                                         withTimeout(timeoutMillis) {
-                                            clear(store, expected, observation, error.status)
+                                            if (!clear(store, expected, observation, error.status)) state.mutex.withLock {
+                                                if (state.uncertainClear == refreshToken) state.uncertainClear = null
+                                            }
                                         }
                                     }
                                 } catch (_: Throwable) {
@@ -223,7 +239,7 @@ private suspend fun refresh(
         if (participated) observation?.point?.invoke(SessionPoint("refresh-joined", "auth.refresh", expected, flight))
         val response = flight.result.await()
         if (selectSuccess) callObservation?.selectResult(flight.metadata)
-        if (read(store, response.status) != response.credentials()) throw ClientError("unauthenticated")
+        if (readSession(store, response.status) != response.credentials()) throw ClientError("unauthenticated")
         return response
     } catch (failure: CancellationException) {
         callObservation?.incomplete()
@@ -235,7 +251,7 @@ private suspend fun refresh(
     }
 }
 
-private suspend fun read(store: SessionStore, status: Int? = null): SessionCredentials? = try {
+internal suspend fun readSession(store: SessionStore, status: Int? = null): SessionCredentials? = try {
     store.read()
 } catch (failure: CancellationException) {
     throw failure
@@ -258,8 +274,9 @@ private suspend fun replace(
     throw ClientError("failed_precondition", status, outcomeUnknown = true)
 }
 
-private suspend fun clear(store: SessionStore, expected: SessionCredentials?, observation: SessionObservation?, status: Int?) {
+private suspend fun clear(store: SessionStore, expected: SessionCredentials?, observation: SessionObservation?, status: Int?): Boolean {
     observation?.clear?.invoke(ClearAttempt(observation.callId, expected, null))
     val removed = replace(store, expected, null, status)
     observation?.clear?.invoke(ClearAttempt(observation.callId, expected, removed))
+    return removed
 }

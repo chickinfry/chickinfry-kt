@@ -7,20 +7,21 @@ import com.chickinfry.HttpTransport
 import com.chickinfry.MemoryStore
 
 val anonymous = HttpTransport("https://api.example.com")
-val store = MemoryStore("https://api.example.com", credentials)
-val signedIn = anonymous.withSession(store)
+val store = MemoryStore("https://api.example.com")
+val transport = anonymous.withSession(store)
 ```
 
-First call signup or signin using the anonymous transport and record the returned
-`SessionCredentials` in the store. Call the suspending `withSession` function
-from a coroutine; an empty store is rejected with `ClientError("unauthenticated")`
-and no HTTP status. Store-read failures use `failed_precondition` unless the
-store already throws a `ClientError`.
+Call the suspending `withSession` function from a coroutine and pass its result
+to the generated SDK's `createClient(transport)` function. An empty store is
+valid. Sign-in and other declared public calls send without credentials from
+an empty store and use the current credentials when signed in. A protected
+call from an empty store fails locally with `unauthenticated` and no HTTP status.
+Store-read failures use `failed_precondition` unless the store already throws
+a `ClientError`.
 
-Pass `signedIn` to the generated SDK's `createClient(signedIn)` function. Successful
-`auth.signup`, `auth.signin`, and `auth.refresh` responses are stored atomically.
-Subsequent calls use the current access token; successful `auth.logout` clears
-only the credentials used by that call. The anonymous transport stays anonymous.
+Successful sign-in, signup with session credentials, and refresh store those
+credentials atomically. Successful `auth.logout` clears only the credentials
+used by that call. The anonymous transport stays anonymous.
 `withBearer(token)` creates a copy with a fixed bearer and no session refresh.
 An origin mismatch is rejected before a network request.
 
@@ -54,10 +55,11 @@ Other refresh failures block the old credentials and attempt to clear only the
 matching record. Existing `ClientError` values are preserved; other failures use
 `unauthenticated` with a received status, if any, and `outcomeUnknown = true`.
 A cleanup failure never replaces the original uncertain refresh failure.
-Later calls that restore those blocked credentials fail locally with
+An uncertain refresh blocks anonymous calls after cleanup. Later calls with
+those blocked credentials fail locally with
 `unauthenticated`, `outcomeUnknown = false`, and no HTTP status. Rewriting the
-same credentials or making another client does not lift the suspension. A
-successful new login with different credentials allows calls to proceed.
+same credentials or making another client does not lift the suspension. Installing a
+fresh session with different credentials allows calls to proceed.
 An older refresh cannot overwrite or clear a newer login, and its original
 request is never replayed using that newer login.
 

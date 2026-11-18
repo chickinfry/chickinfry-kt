@@ -25,7 +25,8 @@ tasks.withType<KotlinJvmCompile>().configureEach {
     friendPaths.from(runtimeCompile.flatMap { it.destinationDirectory })
     friendPaths.from(project(":runtime").tasks.named<Jar>("jvmJar").flatMap { it.archiveFile })
 }
-for (fixture in listOf("plain", "auth")) {
+for (fixture in listOf("plain", "auth", "emptySession")) {
+    if (findProject(":conformance-driver:$fixture") == null) continue
     evaluationDependsOn(":conformance-driver:$fixture")
     val bridge = project(":conformance-driver:$fixture")
     val sdk = findProject(":conformance-driver:${fixture}Sdk")

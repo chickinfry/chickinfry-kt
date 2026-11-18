@@ -20,11 +20,12 @@ include(":conformance-driver")
 val sdkProperties = mapOf(
     "plain" to "chickinfry.conformance.plainSdk",
     "auth" to "chickinfry.conformance.authSdk",
+    "emptySession" to "chickinfry.conformance.emptySessionSdk",
 )
 for ((fixture, property) in sdkProperties) {
-    include(":conformance-driver:$fixture")
+    if (fixture != "emptySession") include(":conformance-driver:$fixture")
     providers.gradleProperty(property).orNull?.let { path ->
-        include(":conformance-driver:${fixture}Sdk")
+        include(":conformance-driver:$fixture", ":conformance-driver:${fixture}Sdk")
         project(":conformance-driver:${fixture}Sdk").projectDir = file(path)
     }
 }

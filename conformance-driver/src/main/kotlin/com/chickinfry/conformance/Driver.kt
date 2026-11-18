@@ -139,7 +139,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             if ("storeRef" in args && "bearerRef" in args) invalidArgs()
             val ref = args.ref("clientRef")
             val fixture = args.string("fixture")
-            if (fixture !in setOf("plain", "auth")) invalidArgs()
+            if (fixture !in setOf("plain", "auth", "emptySession")) invalidArgs()
             synchronized(lock) { if (ref in clients) throw DriverFailure("protocol_violation") }
             val counter = NetworkCounter()
             val observation = CallObservation(id) {}

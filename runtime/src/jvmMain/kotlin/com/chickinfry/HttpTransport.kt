@@ -14,7 +14,6 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPInputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -100,20 +99,10 @@ class HttpTransport private constructor(
         return HttpTransport(origin, client, token, observer, null, beforeResponse, bodyRead)
     }
 
-    /** Reads and validates an existing session before attaching its store. */
+    /** Attaches a store after reading and validating any existing session. */
     suspend fun withSession(store: SessionStore): HttpTransport {
         if (validateOrigin(store.origin) != origin) throw ClientError("failed_precondition")
-        val credentials = try {
-            store.read()
-        } catch (failure: CancellationException) {
-            throw failure
-        } catch (failure: ClientError) {
-            throw failure
-        } catch (_: Throwable) {
-            throw ClientError("failed_precondition")
-        }
-        if (credentials == null || !credentialPattern.matches(credentials.accessToken) ||
-            !credentialPattern.matches(credentials.refreshToken)) throw ClientError("unauthenticated")
+        readSession(store)
         return HttpTransport(origin, client, null, observer, store, beforeResponse, bodyRead)
     }
 
@@ -133,7 +122,15 @@ class HttpTransport private constructor(
 
     override fun toString(): String = "HttpTransport"
 
-    override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T {
+    override suspend fun <T> invoke(operation: String, input: JsonObject, decode: (JsonObject) -> T): T =
+        invoke(operation, input, decode, publicOperation = false)
+
+    override suspend fun <T> invokePublic(operation: String, input: JsonObject, decode: (JsonObject) -> T): T =
+        invoke(operation, input, decode, publicOperation = true)
+
+    private suspend fun <T> invoke(
+        operation: String, input: JsonObject, decode: (JsonObject) -> T, publicOperation: Boolean,
+    ): T {
         val sessionObservation = currentCoroutineContext()[SessionObservation]
         val callObservation = currentCoroutineContext()[CallObservation]
         callObservation?.entered()
@@ -148,11 +145,13 @@ class HttpTransport private constructor(
             if (bytes.size > MAX_REQUEST_BYTES) throw ClientError("resource_exhausted")
             var output: Result<T>? = null
             fun validate(name: String, response: WireResponse) {
-                if (sessionStore != null && name in listOf("auth.signup", "auth.signin", "auth.refresh")) response.credentials()
+                if (sessionStore != null) {
+                    if (name == "auth.refresh") response.credentials() else response.signedInCredentials(name)
+                }
                 if (name == operation) output = Result.success(response.decode(decode))
             }
             val result = sessionStore?.let { store ->
-                invokeSession(store, operation, bytes, client.callTimeoutMillis.toLong(), sessionObservation, callObservation) {
+                invokeSession(store, operation, publicOperation, bytes, client.callTimeoutMillis.toLong(), sessionObservation, callObservation) {
                         name, body, token, exchange -> send(name, body, token, callObservation, exchange) { validate(name, it) }
                 }
             } ?: send(operation, bytes, bearer, callObservation) { validate(operation, it) }

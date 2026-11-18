@@ -8,9 +8,14 @@ import kotlinx.coroutines.runBlocking
 
 fun main(args: Array<String>) {
     val result = try {
-        if (args.size != 4 || args[0] != "--plain-sdk" || args[2] != "--auth-sdk") throw DriverFailure("invalid_args")
+        if (args.size !in setOf(4, 6) || args[0] != "--plain-sdk" || args[2] != "--auth-sdk" ||
+            (args.size == 6 && args[4] != "--empty-session-sdk")) invalidArgs()
         // SDK paths bind the generated build inputs; fixture JARs belong to this distribution.
-        val inputs = mapOf("plain" to Path.of(args[1]), "auth" to Path.of(args[3]))
+        val inputs = buildMap {
+            put("plain", Path.of(args[1]))
+            put("auth", Path.of(args[3]))
+            if (args.size == 6) put("emptySession", Path.of(args[5]))
+        }
         if (inputs.values.any { !Files.isRegularFile(it.resolve("src/main/kotlin/com/chickinfry/client/Client.kt")) }) throw DriverFailure("driver_failed")
         val jar = Path.of(Bridge::class.java.protectionDomain.codeSource.location.toURI())
         val root = jar.parent.parent

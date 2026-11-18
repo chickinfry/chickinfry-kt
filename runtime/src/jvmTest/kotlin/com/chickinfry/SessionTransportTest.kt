@@ -42,27 +42,36 @@ class SessionTransportTest {
         }.use { peer ->
             val store = MemoryStore(peer.origin)
             val anonymous = HttpTransport(peer.origin)
-            val signedUp = anonymous.invoke("auth.signup", empty) { WireResponse(it, 200).credentials() }
-            assertTrue(store.compareAndSet(null, signedUp))
             val session = anonymous.withSession(store)
+            session.invokePublic("auth.signup", empty) { it }
             assertEquals(first, store.read())
             assertEquals(1L, store.snapshot().revision)
             session.invoke("probe.echo", empty) { it }
             anonymous.invoke("probe.echo", empty) { it }
             session.withBearer("x".repeat(43)).invoke("probe.echo", empty) { it }
-            session.invoke("auth.signin", empty) { it }
+            session.invokePublic("auth.signin", empty) { it }
             assertEquals(second, store.read())
             assertEquals(2L, store.snapshot().revision)
             session.invoke("auth.logout", empty) { it }
             assertNull(store.read())
             assertEquals(3L, store.snapshot().revision)
+            val missing = assertFailsWith<ClientError> { session.invoke("probe.echo", empty) { it } }
+            assertEquals("unauthenticated", missing.code)
+            assertNull(missing.status)
+            assertFalse(missing.outcomeUnknown)
+            assertEquals(6, peer.requests.get())
             assertFalse(store.compareAndSet(first, null))
             assertEquals(3L, store.snapshot().revision)
-            assertTrue(store.compareAndSet(null, second))
+            session.invokePublic("probe.list", empty) { it }
+            session.invokePublic("auth.signin", empty) { it }
+            session.invoke("probe.echo", empty) { it }
+            session.invokePublic("probe.list", empty) { it }
+            assertEquals(second, store.read())
             assertTrue(store.compareAndSet(second, second))
             assertEquals(5L, store.snapshot().revision)
             assertEquals(listOf(null, "Bearer ${first.accessToken}", null, "Bearer ${"x".repeat(43)}",
-                "Bearer ${first.accessToken}", "Bearer ${second.accessToken}"), headers)
+                "Bearer ${first.accessToken}", "Bearer ${second.accessToken}", null, null,
+                "Bearer ${second.accessToken}", "Bearer ${second.accessToken}"), headers)
             listOf(first.toString(), first.copy().toString(), store.toString(), session.toString()).forEach {
                 assertFalse(it.contains(first.accessToken))
                 assertFalse(it.contains(first.refreshToken))
@@ -70,18 +79,45 @@ class SessionTransportTest {
             assertEquals("failed_precondition", assertFailsWith<ClientError> {
                 anonymous.withSession(MemoryStore("https://other.example"))
             }.code)
-            assertEquals(6, peer.requests.get())
+            assertEquals(10, peer.requests.get())
+            anonymous.close()
         }
     }
 
     @Test
-    fun missingSessionAndMalformedCredentialsFailBeforeSending() = runBlocking {
+    fun attachEmptyStoreWithoutSending() = runBlocking {
         SessionPeer { it.respond("{}") }.use { peer ->
             val transport = HttpTransport(peer.origin)
-            val missing = assertFailsWith<ClientError> { transport.withSession(MemoryStore(peer.origin)) }
-            assertEquals("unauthenticated", missing.code)
-            assertNull(missing.status)
-            assertFalse(missing.outcomeUnknown)
+            val store = MemoryStore(peer.origin)
+            val session = transport.withSession(store)
+            val refresh = assertFailsWith<ClientError> {
+                session.invoke("auth.refresh", refreshInput(credentials('a'))) { it }
+            }
+            assertEquals("unauthenticated", refresh.code)
+            assertNull(refresh.status)
+            assertNull(store.read())
+            assertEquals(0, peer.requests.get())
+            transport.close()
+        }
+    }
+
+    @Test
+    fun verificationSignupDoesNotRequireOrInstallCredentials() = runBlocking {
+        SessionPeer { exchange -> exchange.respond("""{"accepted":true,"attempt":"pending"}""", 201) }.use { peer ->
+            val transport = HttpTransport(peer.origin)
+            val store = MemoryStore(peer.origin)
+            val response = transport.withSession(store).invokePublic("auth.signup", empty) { it }
+            assertEquals(JsonPrimitive(true), response["accepted"])
+            assertNull(store.read())
+            assertEquals(1, peer.requests.get())
+            transport.close()
+        }
+    }
+
+    @Test
+    fun malformedCredentialsFailBeforeSending() = runBlocking {
+        SessionPeer { it.respond("{}") }.use { peer ->
+            val transport = HttpTransport(peer.origin)
             val invalid = assertFailsWith<ClientError> { credentials('a').copy(accessToken = "bad") }
             assertEquals("invalid_argument", invalid.code)
             assertNull(invalid.status)
@@ -124,9 +160,9 @@ class SessionTransportTest {
                 val store = MemoryStore(peer.origin, original)
                 val session = HttpTransport(peer.origin).withSession(store)
                 if (rejectReplay) {
-                    val failure = assertFailsWith<OperationError> { session.invoke("probe.echo", input) { it } }
+                    val failure = assertFailsWith<OperationError> { session.invokePublic("probe.echo", input) { it } }
                     assertEquals("invalid_token", failure.code)
-                } else session.invoke("probe.echo", input) { it }
+                } else session.invokePublic("probe.echo", input) { it }
                 assertEquals(1, refreshes.get())
                 assertEquals(listOf(serialized, serialized), originals)
                 assertEquals(rotated, store.read())
@@ -218,6 +254,11 @@ class SessionTransportTest {
                     assertNull(failure.cause)
                     assertFalse(failure.toString().contains(original.refreshToken))
                     assertNull(store.read())
+                    val emptyAfterUncertainRefresh = assertFailsWith<ClientError> {
+                        session.invokePublic("probe.list", empty) { it }
+                    }
+                    assertEquals("unauthenticated", emptyAfterUncertainRefresh.code)
+                    assertNull(emptyAfterUncertainRefresh.status)
                     assertTrue(store.compareAndSet(null, original))
                     assertTrue(store.compareAndSet(original, original))
                     val next = HttpTransport(peer.origin).withSession(store)
@@ -231,7 +272,7 @@ class SessionTransportTest {
                     }
                     assertEquals(1, refreshes.get(), variant)
                     assertEquals(2, peer.requests.get(), variant)
-                    next.invoke("auth.signin", empty) { it }
+                    assertTrue(store.compareAndSet(original, login))
                     next.invoke("probe.echo", empty) { it }
                     assertEquals(login, store.read())
                     assertEquals(1, refreshes.get())
@@ -431,7 +472,7 @@ class SessionTransportTest {
                         runCatching { session.invoke("probe.echo", empty) { it } }
                     }
                     awaitLatch(refreshEntered)
-                    session.invoke("auth.signin", empty) { it }
+                    session.invokePublic("auth.signin", empty) { it }
                     assertEquals(login, store.snapshot().credentials)
                     assertEquals(2L, store.snapshot().revision)
                     release.countDown()
@@ -453,19 +494,26 @@ class SessionTransportTest {
         SessionPeer { it.respond("{\"access_token\":\"${original.accessToken}\"}", 201) }.use { peer ->
             val store = MemoryStore(peer.origin, original)
             val failure = assertFailsWith<ClientError> {
-                HttpTransport(peer.origin).withSession(store).invoke("auth.signin", empty) { it }
+                HttpTransport(peer.origin).withSession(store).invokePublic("auth.signin", empty) { it }
             }
             assertEquals("internal", failure.code)
             assertEquals(201, failure.status)
             assertEquals(original, store.read())
+            var unreadable = true
             val broken = object : SessionStore {
                 override val origin = peer.origin
-                override suspend fun read(): SessionCredentials? = error("Private credential ${original.refreshToken}")
+                override suspend fun read(): SessionCredentials? {
+                    if (unreadable) error("Private credential ${original.refreshToken}")
+                    return null
+                }
                 override suspend fun compareAndSet(expected: SessionCredentials?, replacement: SessionCredentials?) = false
             }
-            val storage = assertFailsWith<ClientError> {
-                HttpTransport(peer.origin).withSession(broken).invoke("probe.echo", empty) { it }
-            }
+            val transport = HttpTransport(peer.origin)
+            assertEquals("failed_precondition", assertFailsWith<ClientError> { transport.withSession(broken) }.code)
+            unreadable = false
+            val attached = transport.withSession(broken)
+            unreadable = true
+            val storage = assertFailsWith<ClientError> { attached.invokePublic("probe.list", empty) { it } }
             assertEquals("failed_precondition", storage.code)
             assertNull(storage.status)
             assertFalse(storage.outcomeUnknown)
@@ -655,7 +703,7 @@ class SessionTransportTest {
                 try {
                     withTimeout(3000) { lateRejected.await() }
                     session.invoke("probe.echo", empty) { it }
-                    if (newLogin) session.invoke("auth.signin", empty) { it }
+                    if (newLogin) session.invokePublic("auth.signin", empty) { it }
                     release.complete(Unit)
                     val result = withTimeout(3000) { late.await() }
                     if (newLogin) assertTrue(result.exceptionOrNull() is ClientError) else result.getOrThrow()

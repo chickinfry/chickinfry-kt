@@ -1,17 +1,18 @@
 # JVM conformance driver
 
-This unpublished test application calls two generated Kotlin SDKs through typed
+This unpublished test application calls generated Kotlin SDKs through typed
 bridges. A single distribution contains parent `lib/` JARs and isolated
-`fixtures/plain/` and `fixtures/auth/` JARs. Runtime, session storage, Kotlin,
+fixture JARs under `fixtures/`. Runtime, session storage, Kotlin,
 coroutines and JSON classes are defined once by the parent loader. Each child
 uses parent-first delegation and one fixed ServiceLoader provider. Operations
 are direct generated method calls, never reflective dispatch.
 
 Generate both fixtures with the product CLI first. Supply their generated Kotlin
 module directories using `chickinfry.conformance.plainSdk` and
-`chickinfry.conformance.authSdk`. The property mapping is centralized in
-`settings.gradle.kts`. Generated
-sources are neither copied into this repository nor edited.
+`chickinfry.conformance.authSdk`. An optional
+`chickinfry.conformance.emptySessionSdk` path adds the C-12 SDK generated with
+required verification and a public `probe.list`. The property mapping is
+centralized in `settings.gradle.kts`. Generated sources remain outside this repository.
 
 ```sh
 gradle --offline \
@@ -36,6 +37,8 @@ java --enable-native-access=ALL-UNNAMED -cp '<parent JAR classpath>' \
   --auth-sdk /absolute/auth/client/generated/kotlin
 ```
 
+For a distribution built with the C-12 fixture, also pass
+`--empty-session-sdk /absolute/emptySession/client/generated/kotlin`.
 The SDK arguments identify the generated build inputs; runtime loading uses only
 the packaged fixture JARs. Descriptor 3 must be an inherited anonymous credential
 pipe, consumed through EOF and closed before handshake success. The driver uses
