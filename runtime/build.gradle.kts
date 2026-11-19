@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsRootExtension
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.gradle.api.attributes.java.TargetJvmVersion
 
@@ -41,6 +42,15 @@ kotlin {
 rootProject.plugins.withType<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsRootPlugin> {
     rootProject.extensions.configure<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsEnvSpec> {
         download.set(false)
+    }
+    rootProject.extensions.configure<WasmNodeJsRootExtension> {
+        // The Node targets use Mocha and do not need the fork's browser startup fix.
+        val karmaVersion = "6.4.4"
+        versions.karma.version = karmaVersion
+        toolingInstallTaskProvider.configure {
+            // The plugin's lock records the Git fork as 6.4.4, so request a fresh registry resolution.
+            args.addAll("karma@$karmaVersion", "--save-exact")
+        }
     }
 }
 
