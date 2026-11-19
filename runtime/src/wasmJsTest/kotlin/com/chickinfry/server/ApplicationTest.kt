@@ -25,7 +25,7 @@ import kotlin.test.assertSame
 class ApplicationTest {
     @Test
     fun invalidLogLevelDropsTheRecord(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
-        val context = Context(1.0, "POST", "/greeting.echo")
+        val context = Context(1.0, Request("POST", "/greeting.echo", RequestHeaders(buildJsonObject {})), buildJsonObject {})
         context.log("invalid", "private message")
         assertEquals(1, context.droppedLogs)
         "passed".toJsString()
@@ -254,6 +254,28 @@ class ApplicationTest {
     }
 
     @Test
+    fun explicitErrorDetailsFollowThePublicContract(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+        val cases = listOf(
+            OperationError("invalid_input", 400, "", listOf(FieldError("rows[0].amount", "too_large"))) to
+                """{"status":400,"body":{"error":"invalid_input","message":"","fields":[{"path":"rows[0].amount","code":"too_large"}]}}""",
+            OperationError("invalid_input", 422, "public", listOf(FieldError("undeclared", "required"))) to
+                """{"status":422,"body":{"error":"invalid_input","message":"public"}}""",
+            OperationError("invalid_input", 400, "invalid\n", listOf(FieldError("rows[4294967296].amount", "required"))) to
+                """{"status":400,"body":{"error":"invalid_input"}}""",
+            OperationError("conflict", 409, null, listOf(FieldError("rows[0].amount", "required"))) to
+                """{"status":409,"body":{"error":"conflict"}}""",
+            OperationError("private-text", 400, "private") to """{"status":500,"body":{"error":"operation_failed"}}""",
+        )
+        for ((failure, expected) in cases) {
+            val app = Application({ true }, acceptsField = { operation, path ->
+                operation == "greeting.echo" && path == "rows[].amount"
+            }) { _, _ -> throw failure }
+            assertEquals(expected, app.request())
+        }
+        "passed".toJsString()
+    }
+
+    @Test
     fun operationErrorRejectsNonErrorStatuses() {
         for (status in listOf(-1, 0, 100, 199, 200, 204, 302, 399, 600, 999)) {
             assertFailsWith<IllegalArgumentException> { OperationError("business_failure", status) }
@@ -278,9 +300,9 @@ class ApplicationTest {
     fun unauthenticatedContextAndAuthorizationRejection(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
         var calls = 0
         val app = Application({ true }) { context, _ ->
-            assertEquals(1.0, context.requestId)
-            assertEquals("POST", context.method)
-            assertEquals("/greeting.echo", context.path)
+            assertEquals("POST", context.request.method)
+            assertEquals("/greeting.echo", context.request.path)
+            assertEquals("header-value", context.request.headers["X-Test"])
             calls++
             buildJsonObject { put("message", "accepted") }
         }
@@ -492,7 +514,7 @@ private external fun presenceFixture(): JsonObject
 private external fun corruptDefault(input: JsonObject)
 
 private suspend fun Application.request(authorization: String = "", body: String = "{}"): String =
-    handle(1.0, "POST", "/greeting.echo", "application/json", authorization, body, 0).await().toString()
+    handle(1.0, "POST", "/greeting.echo", "application/json", authorization, body, 0, """{"x-test":"header-value"}""").await().toString()
 
 @JsFun("(reject) => { globalThis.previousLogHost = globalThis.__chik; globalThis.__chik = {log: async () => { if (reject) throw new Error('private credential'); return new TextEncoder().encode('{\"error\":\"log_failed\"}'); }}; }")
 private external fun installLogMock(reject: Boolean)

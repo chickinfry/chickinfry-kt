@@ -79,6 +79,34 @@ class HttpTransportTest {
     }
 
     @Test
+    fun remoteOperationErrorKeepsOnlyValidResponseMessages() = runBlocking {
+        val cases = listOf(
+            """{"error":"conflict"}""" to null,
+            """{"error":"conflict","message":null}""" to null,
+            """{"error":"conflict","message":""}""" to "",
+            """{"error":"conflict","message":"Review ∑"}""" to "Review ∑",
+            """{"error":"conflict","message":false}""" to null,
+            """{"error":"conflict","message":"line\nbreak"}""" to null,
+            """{"error":"conflict","message":"\ud800"}""" to null,
+            """{"error":"conflict","message":"${"é".repeat(513)}"}""" to null,
+        )
+        for ((body, expected) in cases) {
+            Peer { it.reply(body, 409) }.use { peer ->
+                val transport = HttpTransport(peer.origin)
+                try {
+                    val failure = assertFailsWith<OperationError> { transport.invoke("probe.echo", emptyInput) { it } }
+                    assertEquals("conflict", failure.code)
+                    assertEquals(409, failure.status)
+                    assertEquals(expected, failure.responseMessage)
+                    assertEquals("Operation failed (conflict, HTTP 409).", failure.message)
+                } finally {
+                    transport.close()
+                }
+            }
+        }
+    }
+
+    @Test
     fun commonOriginVectorsAndRejectedOriginsNeverSend() = runBlocking {
         val vectors = Json.parseToJsonElement(
             assertNotNull(javaClass.getResource("/origin-vectors.json")).readText(),

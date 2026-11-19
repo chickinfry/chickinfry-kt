@@ -13,6 +13,7 @@ interface Transport {
 class OperationError(
     val code: String,
     val status: Int,
+    val responseMessage: String? = null,
 ) : Exception("Operation failed ($code, HTTP $status).")
 
 class ClientError(

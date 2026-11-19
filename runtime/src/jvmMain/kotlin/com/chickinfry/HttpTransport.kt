@@ -359,7 +359,9 @@ class HttpTransport private constructor(
             if (error == null || !error.isString || !errorPattern.matches(error.content)) {
                 throw ClientError("internal", status, true)
             }
-            throw OperationError(error.content, status)
+            val message = (json["message"] as? JsonPrimitive)
+                ?.takeIf { it.isString }?.content?.let(::publicErrorMessage)
+            throw OperationError(error.content, status, message)
         }
         return WireResponse(json, status).also(validate)
     }

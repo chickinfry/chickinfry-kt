@@ -2,6 +2,7 @@
 
 package com.chickinfry.server
 
+import com.chickinfry.publicErrorMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -18,20 +19,31 @@ import kotlin.js.JsString
 import kotlin.js.Promise
 import kotlin.js.toJsString
 
+/** HTTP metadata for the current operation. */
+class Request internal constructor(val method: String, val path: String, val headers: RequestHeaders)
+
+/** Read-only HTTP headers with case-insensitive lookup. */
+class RequestHeaders internal constructor(private val values: JsonObject) {
+    operator fun get(name: String): String? = headerValue(values, name.toJsString())?.toString()
+}
+
+@JsFun("(headers, name) => { const key = name.toLowerCase(); return Object.hasOwn(headers, key) && typeof headers[key] === 'string' ? headers[key] : null; }")
+private external fun headerValue(headers: JsonObject, name: JsString): JsString?
+
 /** Kotlin server targets do not support platform authentication yet; the context carries no session. */
-open class Context(val requestId: Double, val method: String, val path: String) {
+open class Context internal constructor(
+    protected val requestId: Double,
+    val request: Request,
+    private val secretValues: JsonObject,
+) {
+    protected constructor(context: Context) : this(context.requestId, context.request, context.secretValues)
+
     internal var droppedLogs = 0
         private set
 
-    suspend fun environment(name: String): String? {
-        val text = hostEnvironment("{\"rid\":${requestId.toLong()},\"name\":${jsonValue(name)}}".toJsString()).await().toString()
-        val value = parseInput(text.toJsString()) ?: error("Invalid environment response")
-        val secret = readString(value, "value".toJsString())?.toString()
-        if (secret == "" || readString(value, "error".toJsString()) != null) {
-            throw OperationError("service_unavailable", 503)
-        }
-        return secret
-    }
+    protected fun requireSecret(name: String): String =
+        readString(secretValues, name.toJsString())?.toString() ?: throw OperationError("service_unavailable", 503)
+
     suspend fun log(level: String, message: String, fields: JsonObject? = null) {
         try {
             require(level == "debug" || level == "info" || level == "warn" || level == "error")
@@ -55,6 +67,13 @@ private external fun logFrame(rid: Double, level: JsString, message: JsString, f
 @JsFun("(text) => globalThis.__chik.env(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
 private external fun hostEnvironment(text: JsString): Promise<JsString>
 
+private suspend fun secretValue(rid: Double, name: String): String? {
+    val text = hostEnvironment("{\"rid\":${rid.toLong()},\"name\":${jsonValue(name)}}".toJsString()).await()
+    val value = parseInput(text) ?: return null
+    if (readString(value, "error".toJsString()) != null) return null
+    return readString(value, "value".toJsString())?.toString()?.takeIf { it.isNotEmpty() }
+}
+
 @JsFun("(text) => globalThis.__chik.log(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
 private external fun hostLog(text: JsString): Promise<JsString>
 
@@ -75,12 +94,29 @@ private class RequestOutputDispatcher(private val rid: Double) : CoroutineDispat
     }
 }
 
+/** A declared input path and its public validation code. */
+class FieldError(val path: String, val code: String)
+
 /** An explicit operation failure. Only HTTP client and server error statuses are accepted. */
-class OperationError(val code: String, val status: Int) : Exception() {
+class OperationError(
+    val code: String,
+    val status: Int,
+    override val message: String? = null,
+    val fields: List<FieldError> = emptyList(),
+) : Exception() {
     init {
         require(status in 400..599) { "Operation error status must be between 400 and 599." }
     }
 }
+
+private fun validErrorCode(code: String): Boolean = code.length in 1..64 && code.all { it in 'a'..'z' || it == '_' }
+
+@JsFun("""(path) => {
+    if (path.length > 256 || !/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:_[a-z0-9]+)*|\[(?:0|[1-9][0-9]*)\])*(?![\s\S])/.test(path)) return null;
+    if (Array.from(path.matchAll(/\[([0-9]+)\]/g)).some(match => Number(match[1]) > 4294967295)) return null;
+    return path.replace(/\[[0-9]+\]/g, '[]');
+}""")
+private external fun publicFieldShape(path: JsString): JsString?
 
 private const val MAX_INPUT_BYTES = 4 * 1024 * 1024
 
@@ -263,6 +299,8 @@ fun buildJsonObject(block: JsonObjectBuilder.() -> Unit): JsonObject =
 class Application(
     private val accepts: (String) -> Boolean,
     setup: suspend () -> Unit = {},
+    private val secrets: List<String> = emptyList(),
+    private val acceptsField: (operation: String, path: String) -> Boolean = { _, _ -> false },
     private val dispatch: suspend (Context, JsonObject) -> JsonObject,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -278,7 +316,7 @@ class Application(
 
     fun handle(
         rid: Double, method: String, path: String, contentType: String,
-        authorization: String, body: String, byteLength: Int,
+        authorization: String, body: String, byteLength: Int, headers: String = "{}",
     ): Promise<JsString> = scope.promise(RequestOutputDispatcher(rid)) {
         try {
             initialize()
@@ -300,15 +338,43 @@ class Application(
             val parsed = parseRequestJson(text) ?: throw OperationError("invalid_json", 400)
             val input = requestObject(parsed) ?: throw OperationError("invalid_input", 400)
             if (!uniqueObjectKeys(text) || !validInputStructure(input)) throw OperationError("invalid_input", 400)
-            envelope(200, dispatch(Context(rid, method, path), input))
+            val values = newObject()
+            for (name in secrets) {
+                val value = secretValue(rid, name) ?: continue
+                setField(values, name.toJsString(), value.toJsString())
+            }
+            val request = Request(method, path, RequestHeaders(parseInput(headers.toJsString()) ?: newObject()))
+            envelope(200, dispatch(Context(rid, request, values), input))
         } catch (error: OperationError) {
-            envelope(error.status, buildJsonObject { put("error", error.code) })
+            operationFailure(path, error)
         } catch (_: VaultBindingError) {
             envelope(503, buildJsonObject { put("error", "service_unavailable") })
         } catch (_: Throwable) {
             envelope(500, buildJsonObject { put("error", "operation_failed") })
         }
         response
+    }
+
+    private fun operationFailure(path: String, error: OperationError): JsString {
+        if (!validErrorCode(error.code)) {
+            return envelope(500, buildJsonObject { put("error", "operation_failed") })
+        }
+        return envelope(error.status, buildJsonObject {
+            put("error", error.code)
+            error.message?.let(::publicErrorMessage)?.let { put("message", it) }
+            val fields = error.fields
+            if (error.code == "invalid_input" && fields.size in 1..32 && fields.all { field ->
+                    val shape = publicFieldShape(field.path.toJsString())?.toString()
+                    shape != null && validErrorCode(field.code) && acceptsField(path.removePrefix("/"), shape)
+                }) {
+                put("fields", fields.map { field ->
+                    buildJsonObject {
+                        put("path", field.path)
+                        put("code", field.code)
+                    }
+                })
+            }
+        })
     }
 
 }

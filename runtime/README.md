@@ -76,7 +76,9 @@ The same limit covers the whole call, including queued requests, connection,
 writing, and reading. The accepted range is 1 through 2,147,483,647.
 
 `Transport` is the replaceable client interface. Remote failures use
-`OperationError(code, status)`; local failures use
+`OperationError` with `code`, `status`, and a nullable `responseMessage`.
+A validated server description is available through `responseMessage`, including
+an empty string. The exception message stays diagnostic. Local failures use
 `ClientError(code, status = null, outcomeUnknown = false)`. The local codes are
 `invalid_argument`, `failed_precondition`, `resource_exhausted`,
 `deadline_exceeded`, `canceled`, `unavailable`, `data_loss`, `unimplemented`,
@@ -94,6 +96,18 @@ and a received status, never the original transport or storage exception text.
 `outcomeUnknown` is false for failures proven to occur before transmission
 and true when the server may have performed the operation. Business operations
 are not automatically retried.
+
+## Kotlin server context and errors
+
+Read HTTP metadata through `context.request.method`, `context.request.path`,
+and `context.request.headers`. Header lookup is case-insensitive. A server that
+declares `API_KEY` can read it as `context.secrets.API_KEY`; reading a missing
+or empty declared value produces `service_unavailable` (503).
+
+Throw `com.chickinfry.server.OperationError(code, status, message, fields)`
+for a public failure. The last two arguments are optional. Send validation
+details as `FieldError(path, code)` entries for declared input paths under
+`invalid_input`. The runtime discards invalid optional details independently.
 
 ## Kotlin server: unsupported text functions
 

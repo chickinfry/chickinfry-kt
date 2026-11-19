@@ -27,8 +27,12 @@ private class Values : AbstractMap<String, Any?>() {
 
 fun databaseErrorCode(error: DatabaseError): String? = error.code
 
+private class DatabaseContext(context: Context) : Context(context) {
+    val connection = DatabaseConnection(requestId)
+}
+
 private val application = Application({ it == "probe.run" }) { context, input ->
-    val connection = DatabaseConnection(context.requestId)
+    val connection = DatabaseContext(context).connection
     val id = ColumnDefinition("id", ColumnKind.ID)
     val table = TableDefinition("records", listOf("id"), listOf(
         id, ColumnDefinition("stamp", ColumnKind.TIMESTAMP),
