@@ -57,7 +57,18 @@ enum class TransactionState { ACTIVE, COMMITTED, ROLLED_BACK, COMMIT_UNKNOWN }
 class DatabaseConnection private constructor(
     private val requestId: Double,
     private val lease: Long?,
+    private val borrowed: Boolean = false,
 ) {
+    internal companion object {
+        fun borrowed(rid: Double, lease: Long) = DatabaseConnection(rid, lease, borrowed = true)
+    }
+
+    private var revoked = false
+
+    internal fun revokeBorrowed() {
+        if (borrowed) revoked = true
+    }
+
     constructor(requestId: Double) : this(requestId, null) {
         require(requestId > 0 && requestId <= 9007199254740991.0 && requestId % 1.0 == 0.0)
     }
@@ -67,6 +78,7 @@ class DatabaseConnection private constructor(
     private var transactionRunning = false
 
     internal fun ensureActive() {
+        if (revoked) throw DatabaseError("invalid_host_call")
         check(transactionState == TransactionState.ACTIVE) { "Transaction has ended" }
     }
 
@@ -79,7 +91,9 @@ class DatabaseConnection private constructor(
                 .append(joinStrings(params.map(::jsonValue), ",")).append("]")
             append("}")
         }
-        val response = parseDatabase(hostDatabase(frame.toJsString()).await())
+        val raw = hostDatabase(frame.toJsString()).await()
+        if (borrowed) ensureActive()
+        val response = parseDatabase(raw)
         if (hasField(response, "error".toJsString())) {
             val code = databaseString(response, "error".toJsString())?.toString()
             if (fieldCount(response) != 1 || code == null || !(code in listOf("commit_unknown", "database_failed", "invalid_host_call") ||
@@ -99,6 +113,7 @@ class DatabaseConnection private constructor(
 
     suspend fun <T> transaction(work: suspend (DatabaseConnection) -> T): T {
         ensureActive()
+        if (borrowed) throw DatabaseError("invalid_host_call")
         check(lease == null && !transactionRunning) { "Nested transactions are not supported" }
         transactionRunning = true
         try {

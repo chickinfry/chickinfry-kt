@@ -30,7 +30,7 @@ class RequestHeaders internal constructor(private val values: JsonObject) {
 @JsFun("(headers, name) => { const key = name.toLowerCase(); return Object.hasOwn(headers, key) && typeof headers[key] === 'string' ? headers[key] : null; }")
 private external fun headerValue(headers: JsonObject, name: JsString): JsString?
 
-/** Kotlin server targets do not support platform authentication yet; the context carries no session. */
+/** Resources scoped to the current business request. */
 open class Context internal constructor(
     protected val requestId: Double,
     val request: Request,
@@ -166,7 +166,7 @@ private external fun validInputStructure(input: JsonObject): Boolean
 // JSON.parse keeps only the last duplicate, so duplicates are found in the source text. The text has
 // already parsed, so a string token always ends at the first unescaped quote. Keys compare decoded.
 // Containers deeper than 64 are invalid anyway, so the scan stops there instead of holding a Set per level.
-@JsFun("""(text) => {
+@JsFun("""(text, strictVersion) => {
     const stack = [];
     for (let i = 0; i < text.length; i++) {
         const c = text[i];
@@ -177,6 +177,13 @@ private external fun validInputStructure(input: JsonObject): Boolean
             if (top !== undefined && top.keys !== null && top.expectKey) {
                 const key = JSON.parse(text.slice(i, j + 1));
                 if (top.keys.has(key)) return false;
+                if (strictVersion && stack.length === 1 && key === 'version') {
+                    let start = j + 1;
+                    while (' \t\r\n'.includes(text[start])) start++;
+                    start++;
+                    while (' \t\r\n'.includes(text[start])) start++;
+                    if (text[start] !== '1' || !',} \t\r\n'.includes(text[start + 1])) return false;
+                }
                 top.keys.add(key);
                 top.expectKey = false;
             }
@@ -196,7 +203,7 @@ private external fun validInputStructure(input: JsonObject): Boolean
     }
     return true;
 }""")
-private external fun uniqueObjectKeys(text: JsString): Boolean
+private external fun uniqueObjectKeys(text: JsString, strictVersion: Boolean): Boolean
 
 @JsFun("(input, name) => typeof input[name] === 'string' && Object.hasOwn(input, name) ? input[name] : null")
 internal external fun readString(input: JsonObject, name: JsString): JsString?
@@ -301,6 +308,9 @@ class Application(
     setup: suspend () -> Unit = {},
     private val secrets: List<String> = emptyList(),
     private val acceptsField: (operation: String, path: String) -> Boolean = { _, _ -> false },
+    private val authEnabled: Boolean = false,
+    private val isPublic: (String) -> Boolean = { false },
+    private val authHooks: AuthHooks? = null,
     private val dispatch: suspend (Context, JsonObject) -> JsonObject,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -311,12 +321,13 @@ class Application(
      * are retained. Cancelling a caller only stops its wait; the host owns generation replacement.
      */
     suspend fun initialize() {
+        require(authEnabled || authHooks == null) { "declare auth in auth.yml" }
         initialization.await()
     }
 
     fun handle(
         rid: Double, method: String, path: String, contentType: String,
-        authorization: String, body: String, byteLength: Int, headers: String = "{}",
+        authorization: String, body: String, byteLength: Int, headers: String = "{}", auth: String? = null,
     ): Promise<JsString> = scope.promise(RequestOutputDispatcher(rid)) {
         try {
             initialize()
@@ -324,7 +335,8 @@ class Application(
             return@promise envelope(500, buildJsonObject { put("error", "operation_failed") })
         }
         val response = try {
-            if (method != "POST" || !path.startsWith("/") || !accepts(path.substring(1))) {
+            val name = path.removePrefix("/")
+            if (method != "POST" || !path.startsWith("/") || name.startsWith("auth.") || !accepts(name)) {
                 throw OperationError("not_found", 404)
             }
             if (!isJsonContentType(contentType.toJsString())) {
@@ -333,18 +345,32 @@ class Application(
             if (byteLength > MAX_INPUT_BYTES || utf8Size(body.toJsString()) > MAX_INPUT_BYTES) {
                 throw OperationError("request_too_large", 413)
             }
-            if (authorization.isNotEmpty()) throw OperationError("invalid_token", 401)
+            val public = authEnabled && isPublic(name)
+            val session = if (authEnabled) {
+                if (auth == null || !validRequestID(rid)) invalidAuthFrame()
+                requestSession(parseAuthFrame(auth))
+            } else {
+                if (auth != null) invalidAuthFrame()
+                null
+            }
+            if (authEnabled && !public && session == null) throw OperationError("unauthenticated", 401)
             val text = body.toJsString()
             val parsed = parseRequestJson(text) ?: throw OperationError("invalid_json", 400)
             val input = requestObject(parsed) ?: throw OperationError("invalid_input", 400)
-            if (!uniqueObjectKeys(text) || !validInputStructure(input)) throw OperationError("invalid_input", 400)
+            if (!uniqueObjectKeys(text, false) || !validInputStructure(input)) throw OperationError("invalid_input", 400)
             val values = newObject()
             for (name in secrets) {
                 val value = secretValue(rid, name) ?: continue
                 setField(values, name.toJsString(), value.toJsString())
             }
-            val request = Request(method, path, RequestHeaders(parseInput(headers.toJsString()) ?: newObject()))
-            envelope(200, dispatch(Context(rid, request, values), input))
+            val filtered = requestHeaders(parseInput(headers.toJsString()) ?: newObject(), authEnabled, authorization.toJsString())
+            val base = Context(rid, Request(method, path, RequestHeaders(filtered)), values)
+            val context = when {
+                !authEnabled -> base
+                public -> AuthenticatedContext(base, session)
+                else -> AuthenticatedContext(base, checkNotNull(session))
+            }
+            envelope(200, dispatch(context, input))
         } catch (error: OperationError) {
             operationFailure(path, error)
         } catch (_: VaultBindingError) {
@@ -353,6 +379,51 @@ class Application(
             envelope(500, buildJsonObject { put("error", "operation_failed") })
         }
         response
+    }
+
+    /** Invoked only by the generated host callback entry, outside HTTP dispatch. */
+    fun handleAuthHook(rid: Double, metadata: String, lease: Double? = null): Promise<JsString> =
+        scope.promise(RequestOutputDispatcher(rid)) {
+            try {
+                initialize()
+                if (!authEnabled || !validRequestID(rid)) invalidAuthFrame()
+                val (hook, user) = authHookFrame(parseAuthFrame(metadata))
+                when (hook) {
+                    "userCreating" -> {
+                        if (lease == null || !validRequestID(lease)) invalidAuthFrame()
+                        val connection = DatabaseConnection.borrowed(rid, lease.toLong())
+                        try {
+                            authHooks?.userCreating?.invoke(connection, user)
+                        } catch (_: Throwable) {
+                            throw OperationError("user_creation_failed", 500)
+                        } finally {
+                            connection.revokeBorrowed()
+                        }
+                    }
+                    "userCreated" -> {
+                        if (lease != null) invalidAuthFrame()
+                        try {
+                            authHooks?.userCreated?.invoke(user)
+                        } catch (_: Throwable) {
+                            throw OperationError("user_created_effect_failed", 500)
+                        }
+                    }
+                    else -> invalidAuthFrame()
+                }
+                envelope(200, newObject())
+            } catch (error: OperationError) {
+                envelope(error.status, buildJsonObject { put("error", error.code) })
+            } catch (_: Throwable) {
+                envelope(500, buildJsonObject { put("error", "operation_failed") })
+            }
+        }
+
+    private fun parseAuthFrame(source: String): JsonObject {
+        val text = source.toJsString()
+        if (utf8Size(text) > MAX_INPUT_BYTES) invalidAuthFrame()
+        val frame = parseInput(text) ?: invalidAuthFrame()
+        if (!uniqueObjectKeys(text, true) || !validInputStructure(frame)) invalidAuthFrame()
+        return frame
     }
 
     private fun operationFailure(path: String, error: OperationError): JsString {

@@ -77,3 +77,70 @@ fun asciiLowercase(value: String): String = buildString {
             else value.substring(index, index + 1))
     }
 }
+
+private val authRecords = TableDefinition("records", listOf("id"), listOf(ColumnDefinition("id", ColumnKind.ID)))
+private var retainedAuthConnection: DatabaseConnection? = null
+private var authCalls = 0
+private var completedHooks = 0
+private val authProbe = Application(
+    accepts = { it in listOf("probe.protected", "probe.public", "probe.retained", "auth.session") },
+    authEnabled = true,
+    isPublic = { it == "probe.public" },
+    authHooks = AuthHooks(
+        userCreating = { db, user ->
+            retainedAuthConnection = db
+            try {
+                db.transaction { error("nested transaction was allowed") }
+                error("nested transaction was allowed")
+            } catch (_: DatabaseError) { }
+            Repository(db, authRecords).findMany(FindMany(limit = 1))
+            if (user.id == "fail") error("private hook detail")
+        },
+        userCreated = { completedHooks++ },
+    ),
+) { context, _ ->
+    authCalls++
+    if (context.request.path == "/probe.retained") {
+        Repository(checkNotNull(retainedAuthConnection), authRecords).findMany(FindMany(limit = 1))
+    }
+    check(context.request.headers["Authorization"] == null)
+    check(context.request.headers["Cookie"] == null)
+    check(context.request.headers["Proxy-Authorization"] == null)
+    val session = (context as AuthenticatedContext<*>).auth.session as Session?
+    buildJsonObject {
+        put("session", session?.id ?: "anonymous")
+        if (session != null) {
+            put("user", session.user.id)
+            put("email", session.user.email)
+        }
+    }
+}
+
+@JsExport
+fun authRequest(rid: Double, path: String, auth: String?): Promise<JsString> =
+    authProbe.handle(rid, "POST", path, "application/json", "Bearer raw", "{}", 2,
+        """{"authorization":"Bearer raw","cookie":"app=value","proxy-authorization":"Basic raw"}""", auth)
+
+@JsExport
+fun authHook(rid: Double, frame: String, lease: Double): Promise<JsString> =
+    authProbe.handleAuthHook(rid, frame, if (lease == 0.0) null else lease)
+
+@JsExport
+fun authDispatches(): Int = authCalls
+
+@JsExport
+fun postCommitHooks(): Int = completedHooks
+
+private val authFreeProbe = Application({ it == "probe.run" }) { context, _ ->
+    check(context !is AuthenticatedContext<*>)
+    buildJsonObject {
+        put("authorization", checkNotNull(context.request.headers["Authorization"]))
+        put("cookie", checkNotNull(context.request.headers["Cookie"]))
+        check(context.request.headers["Proxy-Authorization"] == null)
+    }
+}
+
+@JsExport
+fun authFreeRequest(auth: String?): Promise<JsString> =
+    authFreeProbe.handle(10.0, "POST", "/probe.run", "application/json", "Bearer customer", "{}", 2,
+        """{"cookie":"app=value","Proxy-Authorization":"Basic raw"}""", auth)

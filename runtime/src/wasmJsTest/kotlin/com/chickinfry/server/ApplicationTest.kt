@@ -297,18 +297,21 @@ class ApplicationTest {
     }
 
     @Test
-    fun unauthenticatedContextAndAuthorizationRejection(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
+    fun authenticationFreeContextRetainsCustomerHeaders(): Promise<JsString> = GlobalScope.promise(Dispatchers.Default) {
         var calls = 0
         val app = Application({ true }) { context, _ ->
             assertEquals("POST", context.request.method)
             assertEquals("/greeting.echo", context.request.path)
             assertEquals("header-value", context.request.headers["X-Test"])
+            assertEquals("app=value", context.request.headers["Cookie"])
+            assertEquals(if (calls == 0) null else "Bearer external", context.request.headers["Authorization"])
+            assertEquals(null, context.request.headers["Proxy-Authorization"])
             calls++
             buildJsonObject { put("message", "accepted") }
         }
         assertEquals("{\"status\":200,\"body\":{\"message\":\"accepted\"}}", app.request())
-        assertEquals("{\"status\":401,\"body\":{\"error\":\"invalid_token\"}}", app.request("Bearer external"))
-        assertEquals(1, calls)
+        assertEquals("{\"status\":200,\"body\":{\"message\":\"accepted\"}}", app.request("Bearer external"))
+        assertEquals(2, calls)
         "passed".toJsString()
     }
 
@@ -514,7 +517,7 @@ private external fun presenceFixture(): JsonObject
 private external fun corruptDefault(input: JsonObject)
 
 private suspend fun Application.request(authorization: String = "", body: String = "{}"): String =
-    handle(1.0, "POST", "/greeting.echo", "application/json", authorization, body, 0, """{"x-test":"header-value"}""").await().toString()
+    handle(1.0, "POST", "/greeting.echo", "application/json", authorization, body, 0, """{"x-test":"header-value","cookie":"app=value","proxy-authorization":"Basic ignored"}""").await().toString()
 
 @JsFun("(reject) => { globalThis.previousLogHost = globalThis.__chik; globalThis.__chik = {log: async () => { if (reject) throw new Error('private credential'); return new TextEncoder().encode('{\"error\":\"log_failed\"}'); }}; }")
 private external fun installLogMock(reject: Boolean)
