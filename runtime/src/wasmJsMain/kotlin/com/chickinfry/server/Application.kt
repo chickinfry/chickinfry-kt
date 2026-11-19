@@ -3,13 +3,16 @@
 package com.chickinfry.server
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.promise
 import kotlinx.coroutines.await
+import kotlin.coroutines.CoroutineContext
 import kotlin.js.JsAny
 import kotlin.js.JsString
 import kotlin.js.Promise
@@ -23,13 +26,18 @@ open class Context(val requestId: Double, val method: String, val path: String) 
     suspend fun environment(name: String): String? {
         val text = hostEnvironment("{\"rid\":${requestId.toLong()},\"name\":${jsonValue(name)}}".toJsString()).await().toString()
         val value = parseInput(text.toJsString()) ?: error("Invalid environment response")
-        if (readString(value, "error".toJsString()) != null) error("Environment binding unavailable")
-        return readString(value, "value".toJsString())?.toString()
+        val secret = readString(value, "value".toJsString())?.toString()
+        if (secret == "" || readString(value, "error".toJsString()) != null) {
+            throw OperationError("service_unavailable", 503)
+        }
+        return secret
     }
-    suspend fun log(message: String, level: String = "info") {
-        require(level in listOf("debug", "info", "warn", "error"))
+    suspend fun log(level: String, message: String, fields: JsonObject? = null) {
         try {
-            check(hostLog("{\"rid\":${requestId.toLong()},\"level\":${jsonValue(level)},\"message\":${jsonValue(message)}}".toJsString()).await().toString() == "{}")
+            require(level == "debug" || level == "info" || level == "warn" || level == "error")
+            require(message.length <= MAX_INPUT_BYTES && (fields == null || validInputStructure(fields)))
+            val frame = logFrame(requestId, level.toJsString(), message.toJsString(), fields)
+            check(hostLog(frame).await().toString() == "{}")
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
@@ -38,11 +46,34 @@ open class Context(val requestId: Double, val method: String, val path: String) 
     }
 }
 
+@JsFun("""(rid, level, message, fields) => JSON.stringify(fields === null ? {rid, level, message} : {rid, level, message, fields}, (_, value) => {
+    if (value === undefined || typeof value === 'function' || typeof value === 'symbol') throw new TypeError('Invalid log field.');
+    return value;
+})""")
+private external fun logFrame(rid: Double, level: JsString, message: JsString, fields: JsonObject?): JsString
+
 @JsFun("(text) => globalThis.__chik.env(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
 private external fun hostEnvironment(text: JsString): Promise<JsString>
 
 @JsFun("(text) => globalThis.__chik.log(new TextEncoder().encode(text)).then(bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice()))")
 private external fun hostLog(text: JsString): Promise<JsString>
+
+@JsFun("(_) => 0")
+private external fun swapOutputRequest(rid: Double): Double
+
+private class RequestOutputDispatcher(private val rid: Double) : CoroutineDispatcher() {
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        // One synchronous continuation at a time owns the output slot.
+        Dispatchers.Default.dispatch(context, Runnable {
+            val previous = swapOutputRequest(rid)
+            try {
+                block.run()
+            } finally {
+                swapOutputRequest(previous)
+            }
+        })
+    }
+}
 
 /** An explicit operation failure. Only HTTP client and server error statuses are accepted. */
 class OperationError(val code: String, val status: Int) : Exception() {
@@ -56,7 +87,7 @@ private const val MAX_INPUT_BYTES = 4 * 1024 * 1024
 external interface JsonObject : JsAny
 
 @JsFun("(text) => { try { const value = JSON.parse(text); return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null; } catch { return null; } }")
-private external fun parseInput(text: JsString): JsonObject?
+internal external fun parseInput(text: JsString): JsonObject?
 
 // A holder keeps "not JSON" (null) apart from "JSON but not an object", which map to different error codes.
 @JsFun("(text) => { try { return { value: JSON.parse(text) }; } catch { return null; } }")
@@ -132,19 +163,19 @@ private external fun validInputStructure(input: JsonObject): Boolean
 private external fun uniqueObjectKeys(text: JsString): Boolean
 
 @JsFun("(input, name) => typeof input[name] === 'string' && Object.hasOwn(input, name) ? input[name] : null")
-private external fun readString(input: JsonObject, name: JsString): JsString?
+internal external fun readString(input: JsonObject, name: JsString): JsString?
 
 @JsFun("() => Object.create(null)")
 private external fun newObject(): JsonObject
 
 @JsFun("(object, name, value) => { object[name] = value; }")
-private external fun setField(obj: JsonObject, name: JsString, value: JsAny)
+private external fun setField(obj: JsonObject, name: JsString, value: JsAny?)
 
 @JsFun("() => []")
 private external fun newArray(): JsAny
 
 @JsFun("(array, value) => { array.push(value); }")
-private external fun appendItem(array: JsAny, value: JsonObject)
+private external fun appendItem(array: JsAny, value: JsAny?)
 
 @JsFun("(value) => value.split(';', 1)[0].trim().toLowerCase() === 'application/json'")
 private external fun isJsonContentType(value: JsString): Boolean
@@ -168,10 +199,10 @@ fun isNull(input: JsonObject, name: String): Boolean = fieldIsNull(input, name.t
 private external fun readArray(input: JsonObject, name: JsString): JsAny?
 
 @JsFun("(array) => array.length")
-private external fun arraySize(array: JsAny): Int
+internal external fun arraySize(array: JsAny): Int
 
 @JsFun("(array, index) => Object.hasOwn(array, index) && typeof array[index] === 'string' ? array[index] : null")
-private external fun arrayString(array: JsAny, index: Int): JsString?
+internal external fun arrayString(array: JsAny, index: Int): JsString?
 
 @JsFun("(array, index) => { const value = array[index]; return Object.hasOwn(array, index) && value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null; }")
 private external fun arrayObject(array: JsAny, index: Int): JsonObject?
@@ -217,7 +248,8 @@ fun requiredString(input: JsonObject, name: String): String =
 class JsonObjectBuilder {
     internal val value: JsonObject = newObject()
     fun put(name: String, value: String) = setField(this.value, name.toJsString(), value.toJsString())
-    fun put(name: String, values: List<JsonObject>) {
+    fun put(name: String, value: JsAny?) = setField(this.value, name.toJsString(), value)
+    fun put(name: String, values: List<JsAny?>) {
         val array = newArray()
         values.forEach { appendItem(array, it) }
         setField(value, name.toJsString(), array)
@@ -247,7 +279,7 @@ class Application(
     fun handle(
         rid: Double, method: String, path: String, contentType: String,
         authorization: String, body: String, byteLength: Int,
-    ): Promise<JsString> = scope.promise {
+    ): Promise<JsString> = scope.promise(RequestOutputDispatcher(rid)) {
         try {
             initialize()
         } catch (_: Throwable) {
@@ -271,6 +303,8 @@ class Application(
             envelope(200, dispatch(Context(rid, method, path), input))
         } catch (error: OperationError) {
             envelope(error.status, buildJsonObject { put("error", error.code) })
+        } catch (_: VaultBindingError) {
+            envelope(503, buildJsonObject { put("error", "service_unavailable") })
         } catch (_: Throwable) {
             envelope(500, buildJsonObject { put("error", "operation_failed") })
         }

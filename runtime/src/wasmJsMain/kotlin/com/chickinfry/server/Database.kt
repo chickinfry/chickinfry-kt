@@ -17,7 +17,7 @@ internal external fun quoteJson(text: JsString): JsString
 private external fun parseDatabase(text: JsString): JsonObject
 
 @JsFun("(value) => Object.keys(value).length")
-private external fun fieldCount(value: JsonObject): Int
+internal external fun fieldCount(value: JsonObject): Int
 
 @JsFun("(value, name) => Object.hasOwn(value, name)")
 internal external fun hasField(value: JsonObject, name: JsString): Boolean
