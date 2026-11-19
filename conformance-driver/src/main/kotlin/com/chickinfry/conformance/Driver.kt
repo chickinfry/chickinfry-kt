@@ -17,7 +17,7 @@ private fun JsonObject.optionalObject(key: String): JsonObject = if (key in this
 private fun JsonObject.ref(key: String): String = validReference(string(key))
 
 internal class Driver(private val fixtures: Fixtures, private val references: References, private val output: OutputStream) {
-    private data class Client(val fixture: String, val transport: HttpTransport, val bridge: Bridge, val storeRef: String?)
+    private data class Client(val fixture: String, val transport: HttpTransport, val bridge: Bridge, val storeRef: String?, val origin: String = "")
     private data class Barrier(val caseId: String, val point: String, val participants: Set<String>, val arrived: MutableSet<String> = hashSetOf())
     private data class ObservedCall(val caseId: String?, val events: MutableList<Pair<Long, CallEvent>> = mutableListOf(), var incomplete: Boolean = false)
     private data class Arrival(val barrierRef: String, val result: CompletableDeferred<JsonObject>)
@@ -36,6 +36,8 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
     private val ids = AtomicLong()
     private var sequence = 0L
     private var handshaken = false
+    private var protocol = 1
+    private val realtime = RealtimeTrial()
     private var shutdownDeadline = System.nanoTime()
 
     internal var stopped = false
@@ -84,6 +86,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
             input.close()
             withContext(NonCancellable) {
                 jobs.forEach { it.cancel() }
+                realtime.close()
                 val transports = synchronized(lock) {
                     pending.values.forEach { it.result.cancel() }
                     clients.values.map { it.transport }
@@ -117,7 +120,6 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
         validReference(args.string("runId"))
         val versions = args["protocolVersions"] as? JsonArray ?: invalidArgs()
         if (versions.any { it !is JsonPrimitive || it.isString || it.intOrNull == null }) invalidArgs()
-        if (JsonPrimitive(1) !in versions) throw DriverFailure("protocol_mismatch")
         val target = args.obj("target")
         target.fields(setOf("language", "role", "environment"))
         if (target.string("language") != "kotlin" || target.string("role") != "sdk" || target.string("environment") != "jvm") {
@@ -125,17 +127,43 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
         }
         val required = args["requiredCapabilities"] as? JsonArray ?: invalidArgs()
         required.forEach { if (it !is JsonPrimitive || !it.isString) invalidArgs() }
-        if (required.any { (it as JsonPrimitive).content !in capabilities }) throw DriverFailure("unimplemented")
+        protocol = if (JsonPrimitive(2) in versions) 2 else if (JsonPrimitive(1) in versions) 1
+            else throw DriverFailure("protocol_mismatch")
+        val available = if (protocol == 2) capabilities + "realtime-v1" else capabilities
+        if (required.any { (it as JsonPrimitive).content !in available }) throw DriverFailure("unimplemented")
         handshaken = true
         return buildJsonObject {
-            put("protocolVersion", 1); put("driverVersion", "kotlin-jvm-v1")
-            put("capabilities", JsonArray(capabilities.map(::JsonPrimitive)))
+            put("protocolVersion", protocol); put("driverVersion", "kotlin-jvm-v1")
+            put("capabilities", JsonArray(available.map(::JsonPrimitive)))
         }
     }
 
     private suspend fun execute(id: String, command: String, args: JsonObject, startedAt: Long, timeout: Long): JsonObject = when (command) {
+        "realtime.start" -> {
+            if (protocol != 2) invalidArgs()
+            args.fields(common + setOf("clientRef", "channel", "onGap", "eventHandler", "transport"))
+            val entry = client(args.ref("clientRef"))
+            realtime.start(args, entry.bridge, entry.origin)
+            buildJsonObject { put("accepted", true) }
+        }
+        "realtime.observe", "realtime.release", "realtime.unsubscribe", "realtime.cancel", "realtime.second-consumer",
+        "realtime.hold-dispatch", "realtime.release-dispatch" -> {
+            if (protocol != 2) invalidArgs()
+            val fields = when (command) {
+                "realtime.observe" -> setOf("point", "observation")
+                "realtime.release" -> setOf("point")
+                else -> emptySet()
+            }
+            args.fields(common + fields)
+            realtime.command(command, args)
+        }
         "client.create" -> {
-            args.fields(common + setOf("clientRef", "fixture", "origin", "requestTimeoutMs"), setOf("storeRef", "bearerRef"))
+            if (protocol == 2 && args.string("caseId") == "RT-DX-01") {
+                args.fields(common + setOf("clientRef", "fixture", "transport", "origin", "requestTimeoutMs"))
+                if (args.string("transport") != "plain" || args.string("fixture") != "plain") invalidArgs()
+            } else {
+                args.fields(common + setOf("clientRef", "fixture", "origin", "requestTimeoutMs"), setOf("storeRef", "bearerRef"))
+            }
             if ("storeRef" in args && "bearerRef" in args) invalidArgs()
             val ref = args.ref("clientRef")
             val fixture = args.string("fixture")
@@ -156,7 +184,7 @@ internal class Driver(private val fixtures: Fixtures, private val references: Re
                     transport = transport.withSession(store)
                 }
                 if ("bearerRef" in args) transport = transport.withBearer(references.get(args.ref("bearerRef")))
-                val client = Client(fixture, transport, fixtures.create(fixture, transport), storeRef)
+                val client = Client(fixture, transport, fixtures.create(fixture, transport), storeRef, args.string("origin"))
                 synchronized(lock) {
                     if (clients.putIfAbsent(ref, client) != null) { client.transport.close(); throw DriverFailure("protocol_violation") }
                 }

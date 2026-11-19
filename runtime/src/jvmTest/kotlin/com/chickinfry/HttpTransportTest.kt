@@ -51,6 +51,24 @@ private val emptyInput = buildJsonObject {}
 
 class HttpTransportTest {
     @Test
+    fun realtimeTicketFailureKeepsOperationErrorAndRejectsInvalidChannelsLocally() = runBlocking {
+        Peer { it.reply("""{"error":"unauthenticated"}""", 401) }.use { peer ->
+            val transport = HttpTransport(peer.origin)
+            try {
+                val realtime = createRealtimeClient(transport)
+                assertEquals("invalid_argument", assertFailsWith<ClientError> { realtime.subscribe("line\nbreak") }.code)
+                assertEquals(0, peer.requests.get())
+                val failure = assertFailsWith<OperationError> { realtime.subscribe("orders") }
+                assertEquals("unauthenticated", failure.code)
+                assertEquals(401, failure.status)
+                assertEquals(1, peer.requests.get())
+            } finally {
+                transport.close()
+            }
+        }
+    }
+
+    @Test
     fun constructorCounterMeasuresRealNetworkEntryAndRawErrors() = runBlocking {
         val counter = NetworkCounter()
         Peer { it.reply("{}") }.use { peer ->

@@ -1,5 +1,7 @@
 package com.chickinfry.conformance
 
+import com.chickinfry.RealtimeSubscription
+import com.chickinfry.SubscribeOptions
 import com.chickinfry.Transport
 import java.io.Closeable
 import java.net.URLClassLoader
@@ -13,6 +15,9 @@ interface BridgeFactory {
 
 interface Bridge {
     suspend fun call(operation: String, input: JsonObject): JsonObject
+
+    suspend fun subscribe(channel: String, options: SubscribeOptions): RealtimeSubscription =
+        throw DriverFailure("unimplemented")
 }
 
 class DriverFailure(val code: String) : Exception("Driver request failed.")

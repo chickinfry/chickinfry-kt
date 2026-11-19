@@ -114,6 +114,13 @@ class HttpTransport private constructor(
     ): HttpTransport =
         HttpTransport(origin, client, bearer, observer, sessionStore, beforeResponse, bodyRead)
 
+    internal val hasRealtimeSession: Boolean get() = sessionStore != null
+
+    internal suspend fun realtimeSession(): SessionCredentials? = sessionStore?.let { readSession(it) }
+
+    internal fun realtimeSocket(address: String, listener: okhttp3.WebSocketListener): okhttp3.WebSocket =
+        client.newWebSocket(Request.Builder().url(address).header("Origin", origin.toString().removeSuffix("/")).build(), listener)
+
     internal fun close() {
         client.dispatcher.cancelAll()
         client.connectionPool.evictAll()

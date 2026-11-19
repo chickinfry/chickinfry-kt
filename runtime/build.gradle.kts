@@ -30,7 +30,7 @@ kotlin {
         }
         jvmMain.dependencies {
             implementation("com.squareup.okhttp3:okhttp:${rootProject.extra["okhttpVersion"]}")
-            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${rootProject.extra["coroutinesVersion"]}")
+            api("org.jetbrains.kotlinx:kotlinx-coroutines-core:${rootProject.extra["coroutinesVersion"]}")
             api("org.jetbrains.kotlinx:kotlinx-serialization-json:${rootProject.extra["serializationVersion"]}")
         }
         jvmTest.dependencies {

@@ -1,5 +1,8 @@
 package com.chickinfry.conformance.plain
 
+import com.chickinfry.RealtimeClient
+import com.chickinfry.RealtimeSubscription
+import com.chickinfry.SubscribeOptions
 import com.chickinfry.Transport
 import com.chickinfry.client.*
 import com.chickinfry.conformance.*
@@ -10,6 +13,13 @@ class Factory : BridgeFactory {
 }
 
 private class TypedBridge(private val client: Client) : Bridge {
+    override suspend fun subscribe(channel: String, options: SubscribeOptions): RealtimeSubscription {
+        // The protocol-1 plain fixture has no declared realtime property.
+        val realtime = try { client.javaClass.getMethod("getRealtime").invoke(client) as RealtimeClient }
+        catch (_: ReflectiveOperationException) { throw DriverFailure("unimplemented") }
+        return realtime.subscribe(channel, options)
+    }
+
     override suspend fun call(operation: String, input: JsonObject): JsonObject = when (operation) {
         "probe.echo" -> {
             input.fields(setOf("wire_value"))
