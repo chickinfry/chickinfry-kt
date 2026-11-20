@@ -6,6 +6,7 @@ import org.gradle.api.attributes.java.TargetJvmVersion
 plugins {
     kotlin("multiplatform")
     `maven-publish`
+    id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
 kotlin {
@@ -76,8 +77,53 @@ tasks.withType<Test>().configureEach {
     }
 }
 
+// Central publishes through the Sonatype portal and requires a signed POM and
+// artifacts. The release workflow supplies the credentials and the signing key
+// from a publishing-only environment; a local build without them is unaffected.
+mavenPublishing {
+    publishToMavenCentral()
+    // Signing is opt-out so the release workflow can stage the exact bytes first,
+    // inspect them, and add the signatures as the last step before uploading.
+    // Signatures are detached .asc files, so signing never changes the staged
+    // artifacts the boundary scan approved.
+    if (providers.gradleProperty("signPublications").orNull != "false") signAllPublications()
+    coordinates("com.chickinfry", "chickinfry", project.version.toString())
+    pom {
+        name.set("Chickinfry")
+        description.set("Kotlin runtime for Chickinfry generated clients and servers.")
+        url.set("https://chickinfry.com")
+        licenses {
+            license {
+                name.set("Apache License 2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                distribution.set("repo")
+            }
+        }
+        // Central requires developer information in the POM; without it the
+        // portal rejects the first upload.
+        developers {
+            developer {
+                id.set("chickinfry")
+                name.set("Chickinfry")
+                url.set("https://chickinfry.com")
+            }
+        }
+        scm {
+            connection.set("scm:git:https://github.com/chickinfry/chickinfry-kt.git")
+            developerConnection.set("scm:git:ssh://git@github.com/chickinfry/chickinfry-kt.git")
+            url.set("https://github.com/chickinfry/chickinfry-kt")
+        }
+    }
+}
+
+// The release workflow publishes the signed artifacts into a local directory
+// first, scans those exact bytes, and only then uploads. Without this repository
+// the boundary scan would have to run against a rebuild, not the shipped files.
 publishing {
-    publications.withType<MavenPublication>().configureEach {
-        artifactId = if (name == "kotlinMultiplatform") "chickinfry" else "chickinfry-$name"
+    repositories {
+        maven {
+            name = "staging"
+            url = uri(layout.buildDirectory.dir("staging-deploy"))
+        }
     }
 }

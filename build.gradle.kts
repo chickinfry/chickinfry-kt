@@ -17,5 +17,12 @@ allprojects {
         resolutionStrategy.dependencySubstitution {
             substitute(module("com.chickinfry:chickinfry:0.0.0")).using(project(":runtime"))
         }
+        // The publish plugin brings BouncyCastle 1.84, which carries two high-severity
+        // advisories. Force the first release that clears them.
+        resolutionStrategy.eachDependency {
+            if (requested.group == "org.bouncycastle" && requested.version == "1.84") {
+                useVersion("1.85")
+            }
+        }
     }
 }
