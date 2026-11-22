@@ -144,3 +144,20 @@ private val authFreeProbe = Application({ it == "probe.run" }) { context, _ ->
 fun authFreeRequest(auth: String?): Promise<JsString> =
     authFreeProbe.handle(10.0, "POST", "/probe.run", "application/json", "Bearer customer", "{}", 2,
         """{"cookie":"app=value","Proxy-Authorization":"Basic raw"}""", auth)
+
+private class RealtimeContext(context: Context) : Context(context) {
+    val realtime = Realtime(requestId)
+}
+
+private val realtimeProbe = Application({ it == "probe.publish" }, authorizeRealtime = { _, channel -> channel == "orders" }) { context, input ->
+    RealtimeContext(context).realtime.publish("orders", input)
+    buildJsonObject { put("published", "yes") }
+}
+
+@JsExport
+fun realtimeRequest(rid: Double, body: String): Promise<JsString> =
+    realtimeProbe.handle(rid, "POST", "/probe.publish", "application/json", "", body, body.length)
+
+@JsExport
+fun realtimeAuthorize(rid: Double, body: String): Promise<JsString> =
+    realtimeProbe.handleRealtimeAuthorize(rid, body)

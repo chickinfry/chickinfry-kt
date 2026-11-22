@@ -17,6 +17,7 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.js.JsAny
 import kotlin.js.JsString
 import kotlin.js.Promise
+import kotlin.js.toJsBoolean
 import kotlin.js.toJsString
 
 /** HTTP metadata for the current operation. */
@@ -109,7 +110,7 @@ class OperationError(
     }
 }
 
-private fun validErrorCode(code: String): Boolean = code.length in 1..64 && code.all { it in 'a'..'z' || it == '_' }
+internal fun validErrorCode(code: String): Boolean = code.length in 1..64 && code.all { it in 'a'..'z' || it == '_' }
 
 @JsFun("""(path) => {
     if (path.length > 256 || !/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:_[a-z0-9]+)*|\[(?:0|[1-9][0-9]*)\])*(?![\s\S])/.test(path)) return null;
@@ -311,6 +312,7 @@ class Application(
     private val authEnabled: Boolean = false,
     private val isPublic: (String) -> Boolean = { false },
     private val authHooks: AuthHooks? = null,
+    private val authorizeRealtime: (suspend (Context, String) -> Boolean)? = null,
     private val dispatch: suspend (Context, JsonObject) -> JsonObject,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -411,6 +413,54 @@ class Application(
                     else -> invalidAuthFrame()
                 }
                 envelope(200, newObject())
+            } catch (error: OperationError) {
+                envelope(error.status, buildJsonObject { put("error", error.code) })
+            } catch (_: Throwable) {
+                envelope(500, buildJsonObject { put("error", "operation_failed") })
+            }
+        }
+
+    /**
+     * Invoked only by the generated host callback entry for the engine's authorization callback,
+     * after the host verified the engine proof and revalidated the session. Only the application's
+     * decision remains: a missing decision, an exception or a malformed frame denies the channel
+     * or fails the call, and the reply is {"allowed": true | false}.
+     */
+    fun handleRealtimeAuthorize(rid: Double, body: String, headers: String = "{}", auth: String? = null): Promise<JsString> =
+        scope.promise(RequestOutputDispatcher(rid)) {
+            try {
+                initialize()
+                val text = body.toJsString()
+                val input = parseInput(text)
+                if (input == null || utf8Size(text) > MAX_INPUT_BYTES || !uniqueObjectKeys(text, false) ||
+                    !validInputStructure(input) || fieldCount(input) != 1) {
+                    throw OperationError("invalid_input", 400)
+                }
+                val channel = readString(input, "channel".toJsString())?.toString() ?: throw OperationError("invalid_input", 400)
+                val session = if (authEnabled) {
+                    if (auth == null || !validRequestID(rid)) invalidAuthFrame()
+                    requestSession(parseAuthFrame(auth))
+                } else {
+                    if (auth != null) invalidAuthFrame()
+                    null
+                }
+                val values = newObject()
+                for (name in secrets) {
+                    val value = secretValue(rid, name) ?: continue
+                    setField(values, name.toJsString(), value.toJsString())
+                }
+                val filtered = requestHeaders(parseInput(headers.toJsString()) ?: newObject(), authEnabled, "".toJsString())
+                val base = Context(rid, Request("POST", "/realtime", RequestHeaders(filtered)), values)
+                val context = if (authEnabled) AuthenticatedContext(base, session) else base
+                val decide = authorizeRealtime
+                val allowed = decide != null && try {
+                    decide(context, channel)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    false
+                }
+                envelope(200, buildJsonObject { put("allowed", allowed.toJsBoolean()) })
             } catch (error: OperationError) {
                 envelope(error.status, buildJsonObject { put("error", error.code) })
             } catch (_: Throwable) {
