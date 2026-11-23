@@ -9,13 +9,13 @@ extra["serializationVersion"] = "1.11.0"
 
 allprojects {
     group = "com.chickinfry"
-    version = "0.0.0"
+    version = "0.5.0"
 }
 
 allprojects {
     configurations.configureEach {
         resolutionStrategy.dependencySubstitution {
-            substitute(module("com.chickinfry:chickinfry:0.0.0")).using(project(":runtime"))
+            substitute(module("com.chickinfry:chickinfry:${rootProject.version}")).using(project(":runtime"))
         }
         // The publish plugin brings BouncyCastle 1.84, which carries two high-severity
         // advisories. Force the first release that clears them.
