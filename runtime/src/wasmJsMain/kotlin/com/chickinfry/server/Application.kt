@@ -108,6 +108,18 @@ class OperationError(
     init {
         require(status in 400..599) { "Operation error status must be between 400 and 599." }
     }
+
+    // BEGIN generated operation errors
+
+    companion object {
+        fun notFound(): OperationError = OperationError("not_found", 404)
+        fun invalidInput(): OperationError = OperationError("invalid_input", 400)
+        fun conflict(): OperationError = OperationError("conflict", 409)
+        fun forbidden(): OperationError = OperationError("forbidden", 403)
+        fun notImplemented(): OperationError = OperationError("not_implemented", 501)
+    }
+
+    // END generated operation errors
 }
 
 internal fun validErrorCode(code: String): Boolean = code.length in 1..64 && code.all { it in 'a'..'z' || it == '_' }
