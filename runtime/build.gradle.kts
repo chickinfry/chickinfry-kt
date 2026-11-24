@@ -20,6 +20,7 @@ kotlin {
         nodejs()
         compilerOptions {
             freeCompilerArgs.add("-Xwasm-use-new-exception-proposal")
+            freeCompilerArgs.add("-Xklib-relative-path-base=${projectDir.absolutePath}")
         }
     }
     sourceSets {
