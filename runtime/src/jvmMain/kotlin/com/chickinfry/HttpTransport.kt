@@ -56,7 +56,7 @@ private val errorPattern = Regex("[a-z_]+")
 private val jsonMediaType = "application/json".toMediaType()
 
 private val pinnedBufferLibraries by lazy {
-    pinnedJar(OkHttpClient::class.java, "234194a04aac54858df0a750d243af7b2e39df5e4eb86e9912043ad33a9f9a52") &&
+    pinnedJar(OkHttpClient::class.java, "4039527bd1f2e40b66e20b0e52c689cf56074b938ea02678141495f5160f1047") &&
         pinnedJar(Buffer::class.java, "b97b640557a650d15411f2be29aef558c4e422a83653cb18ba494311dbed18be")
 }
 

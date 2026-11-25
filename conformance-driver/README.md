@@ -62,7 +62,7 @@ Advertised capabilities are `client.create`, `client.copy`, `client.call`,
 existing `client.observe` command; it is not a separate capability. Quantitative
 completeness is restricted to unencoded 3xx responses on a direct loopback
 HTTP/1.1 connection with the default socket factory, Temurin 27+35, and the exact
-OkHttp 5.5.0 / Okio 3.18.1 JARs below. The driver obtains these facts from the
+OkHttp 5.5.1 / Okio 3.18.1 JARs below. The driver obtains these facts from the
 runtime connection and response, never from case IDs. HTTP/2 remains disabled.
 
 For that early rejection path, the conservative fixed active-body buffer sum
@@ -82,7 +82,7 @@ bucket, not the sum of all active buffers.
 | OkHttp `internal/http1/Http1ExchangeCodec.kt:460-470,530-538`, `internal/-UtilJvm.kt:155-180,196-203` | Discard: 8,192 bytes, cleared after each read. Framing has no separate payload array. |
 | Runtime `HttpTransport.readResponse` | SDK chunk: 8,192 bytes reserved; SDK accumulation and body copies: zero on early 3xx rejection. |
 
-OkHttp sources are pinned to `a94bdf152084d11acecd44dcd09ffef203f4f0aa`
+OkHttp sources are pinned to `be5151ac3b63d3db405b9dbb62632c36cc6a657e`
 under `okhttp/src/commonJvmAndroid/kotlin/okhttp3/`. Okio sources are pinned to
 `9f564fd76310120e35b4ffb94b62d6ab2a26207d` under `okio/src/`;
 `DefaultSocket.kt` and `RealBufferedSource.kt` use `jvmMain/kotlin/okio/`,
@@ -91,7 +91,7 @@ while the internal buffered-source implementation and `Segment.kt` use
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `okhttp-jvm-5.5.0.jar` | `234194a04aac54858df0a750d243af7b2e39df5e4eb86e9912043ad33a9f9a52` |
+| `okhttp-jvm-5.5.1.jar` | `4039527bd1f2e40b66e20b0e52c689cf56074b938ea02678141495f5160f1047` |
 | `okio-jvm-3.18.1.jar` | `b97b640557a650d15411f2be29aef558c4e422a83653cb18ba494311dbed18be` |
 
 Gzip/other content encodings, HTTPS, other JVM/library binaries, proxies/custom
@@ -117,8 +117,8 @@ use coroutine context elements, including explicitly captured refresh ownership.
 The counter is tested as zero during construction and positive on a real
 loopback send; it is not a constant zero or command count.
 
-Pinned OkHttp 5.5.0 source evidence (commit
-`a94bdf152084d11acecd44dcd09ffef203f4f0aa`, path prefix
+Pinned OkHttp 5.5.1 source evidence (commit
+`be5151ac3b63d3db405b9dbb62632c36cc6a657e`, path prefix
 `okhttp/src/commonJvmAndroid/kotlin/okhttp3/`):
 
 | Source | Construction / network boundary |
