@@ -5,7 +5,9 @@ plugins {
 
 extra["okhttpVersion"] = "5.5.1"
 extra["coroutinesVersion"] = "1.11.0"
-extra["serializationVersion"] = "1.11.0"
+extra["serializationVersion"] = "1.13.0"
+// JUnit 6 needs Java 17; the 5.x line still runs the tests on the Java 8 lower bound.
+extra["junitVersion"] = "5.14.4"
 
 allprojects {
     group = "com.chickinfry"

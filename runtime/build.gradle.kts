@@ -1,5 +1,4 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsRootExtension
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.gradle.api.attributes.java.TargetJvmVersion
 
@@ -36,7 +35,8 @@ kotlin {
             api("org.jetbrains.kotlinx:kotlinx-serialization-json:${rootProject.extra["serializationVersion"]}")
         }
         jvmTest.dependencies {
-            implementation(kotlin("test-junit"))
+            implementation(kotlin("test-junit5"))
+            implementation(project.dependencies.platform("org.junit:junit-bom:${rootProject.extra["junitVersion"]}"))
         }
     }
 }
@@ -45,14 +45,11 @@ rootProject.plugins.withType<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.Was
     rootProject.extensions.configure<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsEnvSpec> {
         download.set(false)
     }
-    rootProject.extensions.configure<WasmNodeJsRootExtension> {
-        // The Node targets use Mocha and do not need the fork's browser startup fix.
-        val karmaVersion = "6.4.4"
-        versions.karma.version = karmaVersion
-        toolingInstallTaskProvider.configure {
-            // The plugin's lock records the Git fork as 6.4.4, so request a fresh registry resolution.
-            args.addAll("karma@$karmaVersion", "--save-exact")
-        }
+    rootProject.extensions.configure<org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNpmTooling> {
+        // Wasm Node tests run on KGP's built-in Node runner, which needs no npm packages.
+        // An explicit directory skips the default install of the whole web tooling set
+        // (Karma, webpack, Mocha), so nothing is fetched outside the committed npm lock.
+        installationDir.set(rootProject.layout.buildDirectory.dir("wasm-tooling"))
     }
 }
 
@@ -73,6 +70,7 @@ tasks.withType<JavaCompile>().configureEach {
 // CI-only override: Gradle stays on the mise JDK while tests run on the lower-bound JVM.
 // Without the property the local default JVM runs the tests, as before.
 tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
     providers.gradleProperty("testJvmHome").orNull?.let { home ->
         executable = file("$home/bin/java").absolutePath
     }

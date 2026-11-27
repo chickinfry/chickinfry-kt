@@ -16,7 +16,8 @@ application {
 dependencies {
     implementation(project(":runtime"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${rootProject.extra["coroutinesVersion"]}")
-    testImplementation(kotlin("test-junit"))
+    testImplementation(kotlin("test-junit5"))
+    testImplementation(platform("org.junit:junit-bom:${rootProject.extra["junitVersion"]}"))
 }
 evaluationDependsOn(":runtime")
 val runtimeCompile = project(":runtime").tasks.named<KotlinJvmCompile>("compileKotlinJvm")
@@ -40,7 +41,10 @@ for (fixture in listOf("plain", "auth", "emptySession")) {
         }
     }
 }
-tasks.named<Test>("test") { jvmArgs("--enable-native-access=ALL-UNNAMED") }
+tasks.named<Test>("test") {
+    useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+}
 tasks.named<Zip>("distZip") { archiveFileName.set("conformance-driver.zip") }
 
 tasks.matching { it.name in listOf("test", "distZip") }.configureEach {
